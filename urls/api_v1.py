@@ -6,6 +6,8 @@ from rest_framework_simplejwt.views import (
 
 from api_v1.statuses.views import StatusAPIView
 from approvals.views import (
+    AdminUserDetailAPIView,
+    AdminUserListCreateAPIView,
     CurrentUserAPIView,
     HealthCheckAPIView,
     LoginAPIView,
@@ -24,4 +26,7 @@ urlpatterns = [
     path("token/refresh/", TokenRefreshView.as_view(), name="token-refresh"),
     path("login/", LoginAPIView.as_view(), name="login"),
     path("me/", CurrentUserAPIView.as_view(), name="current-user"),
+    # Admin User & Role Management APIs
+    path("admin/users/", AdminUserListCreateAPIView.as_view(), name="admin-user-list-create"),
+    path("admin/users/<int:pk>/", AdminUserDetailAPIView.as_view(), name="admin-user-detail"),
 ]

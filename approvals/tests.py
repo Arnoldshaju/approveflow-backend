@@ -204,3 +204,106 @@ class RoleAndPermissionTests(APITestCase):
             self.assertFalse(perm_class().has_permission(DummyRequest(anon), None))
 
 
+class AdminUserManagementAPITests(APITestCase):
+    def setUp(self):
+        from approvals.models import UserProfile
+        from rest_framework_simplejwt.tokens import RefreshToken
+
+        self.UserProfile = UserProfile
+
+        # Admin user
+        self.admin_user = User.objects.create_superuser(
+            username="admin_boss",
+            password="AdminPassword123!",
+            email="admin@approveflow.com",
+        )
+        self.admin_user.profile.role = UserProfile.Role.ADMIN
+        self.admin_user.profile.save()
+
+        # Regular employee user
+        self.employee_user = User.objects.create_user(
+            username="regular_emp",
+            password="EmpPassword123!",
+            email="emp@approveflow.com",
+        )
+        self.employee_user.profile.role = UserProfile.Role.EMPLOYEE
+        self.employee_user.profile.save()
+
+        # JWT tokens
+        self.admin_token = str(RefreshToken.for_user(self.admin_user).access_token)
+        self.employee_token = str(RefreshToken.for_user(self.employee_user).access_token)
+
+    def test_admin_can_list_users(self):
+        """Admin can list all registered users with their roles and manager details."""
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.admin_token}")
+        response = self.client.get("/api/v1/admin/users/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(len(response.data) >= 2)
+        usernames = [u["username"] for u in response.data]
+        self.assertIn("admin_boss", usernames)
+        self.assertIn("regular_emp", usernames)
+
+    def test_admin_can_create_user_with_role(self):
+        """Admin can create a new user account with a specified role."""
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.admin_token}")
+        payload = {
+            "username": "sarah_manager",
+            "password": "ManagerPass123!",
+            "email": "sarah@approveflow.com",
+            "role": "MANAGER",
+        }
+        response = self.client.post("/api/v1/admin/users/", payload)
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data["username"], "sarah_manager")
+        self.assertEqual(response.data["role"], "MANAGER")
+
+        # Verify password and profile in database
+        created_user = User.objects.get(username="sarah_manager")
+        self.assertTrue(created_user.check_password("ManagerPass123!"))
+        self.assertEqual(created_user.profile.role, self.UserProfile.Role.MANAGER)
+
+    def test_admin_can_assign_manager_and_update_role(self):
+        """Admin can update an employee's role and map them to a reviewing manager."""
+        # Create a manager
+        manager = User.objects.create_user(
+            username="bob_mgr", password="Password123!"
+        )
+        manager.profile.role = self.UserProfile.Role.MANAGER
+        manager.profile.save()
+
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.admin_token}")
+        payload = {
+            "role": "EMPLOYEE",
+            "manager_id": manager.id,
+        }
+        response = self.client.patch(
+            f"/api/v1/admin/users/{self.employee_user.id}/", payload
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.employee_user.refresh_from_db()
+        self.assertEqual(self.employee_user.profile.manager, manager)
+        self.assertEqual(response.data["manager"]["id"], manager.id)
+        self.assertEqual(response.data["manager"]["username"], "bob_mgr")
+
+    def test_non_admin_forbidden_from_admin_apis(self):
+        """Employees receive 403 Forbidden when attempting to access admin user APIs."""
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.employee_token}")
+        get_response = self.client.get("/api/v1/admin/users/")
+        self.assertEqual(get_response.status_code, status.HTTP_403_FORBIDDEN)
+
+        post_response = self.client.post(
+            "/api/v1/admin/users/",
+            {"username": "hacker", "password": "Password123!"},
+        )
+        self.assertEqual(post_response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_unauthenticated_rejected_with_401(self):
+        """Unauthenticated requests to admin user APIs are rejected with 401 Unauthorized."""
+        response = self.client.get("/api/v1/admin/users/")
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+
+
