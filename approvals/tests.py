@@ -98,3 +98,109 @@ class AuthenticationAndProfileTests(APITestCase):
         self.assertEqual(statuses_res.status_code, status.HTTP_200_OK)
         self.assertIn("statuses", statuses_res.data)
 
+
+class DummyRequest:
+    def __init__(self, user):
+        self.user = user
+
+
+class RoleAndPermissionTests(APITestCase):
+    def setUp(self):
+        from approvals.models import UserProfile
+        from approvals.permissions import (
+            IsAdmin,
+            IsEmployee,
+            IsFinance,
+            IsManager,
+        )
+
+        self.UserProfile = UserProfile
+        self.IsEmployee = IsEmployee
+        self.IsManager = IsManager
+        self.IsFinance = IsFinance
+        self.IsAdmin = IsAdmin
+
+        self.employee = User.objects.create_user(
+            username="emp1", password="Password123!", email="emp1@example.com"
+        )
+        self.manager = User.objects.create_user(
+            username="mgr1", password="Password123!", email="mgr1@example.com"
+        )
+        self.manager.profile.role = UserProfile.Role.MANAGER
+        self.manager.profile.save()
+
+        self.finance = User.objects.create_user(
+            username="fin1", password="Password123!", email="fin1@example.com"
+        )
+        self.finance.profile.role = UserProfile.Role.FINANCE
+        self.finance.profile.save()
+
+        self.admin = User.objects.create_user(
+            username="adm1", password="Password123!", email="adm1@example.com"
+        )
+        self.admin.profile.role = UserProfile.Role.ADMIN
+        self.admin.profile.save()
+
+    def test_user_profile_created_automatically(self):
+        """Newly created users automatically receive a UserProfile with EMPLOYEE role."""
+        new_user = User.objects.create_user(
+            username="newhire", password="Password123!"
+        )
+        self.assertTrue(hasattr(new_user, "profile"))
+        self.assertEqual(new_user.profile.role, self.UserProfile.Role.EMPLOYEE)
+
+    def test_manager_assignment_relationship(self):
+        """An employee can be mapped to an assigned manager and queried via reverse relation."""
+        self.employee.profile.manager = self.manager
+        self.employee.profile.save()
+
+        self.assertEqual(self.employee.profile.manager, self.manager)
+        self.assertEqual(
+            self.manager.subordinates.first().user,
+            self.employee,
+        )
+
+    def test_is_employee_permission(self):
+        """IsEmployee grants access only to users with EMPLOYEE role."""
+        perm = self.IsEmployee()
+        self.assertTrue(perm.has_permission(DummyRequest(self.employee), None))
+        self.assertFalse(perm.has_permission(DummyRequest(self.manager), None))
+        self.assertFalse(perm.has_permission(DummyRequest(self.finance), None))
+        self.assertFalse(perm.has_permission(DummyRequest(self.admin), None))
+
+    def test_is_manager_permission(self):
+        """IsManager grants access only to users with MANAGER role."""
+        perm = self.IsManager()
+        self.assertTrue(perm.has_permission(DummyRequest(self.manager), None))
+        self.assertFalse(perm.has_permission(DummyRequest(self.employee), None))
+        self.assertFalse(perm.has_permission(DummyRequest(self.finance), None))
+
+    def test_is_finance_permission(self):
+        """IsFinance grants access only to users with FINANCE role."""
+        perm = self.IsFinance()
+        self.assertTrue(perm.has_permission(DummyRequest(self.finance), None))
+        self.assertFalse(perm.has_permission(DummyRequest(self.employee), None))
+        self.assertFalse(perm.has_permission(DummyRequest(self.manager), None))
+
+    def test_is_admin_permission(self):
+        """IsAdmin grants access to ADMIN role and superusers, but not standard employees."""
+        perm = self.IsAdmin()
+        self.assertTrue(perm.has_permission(DummyRequest(self.admin), None))
+
+        superuser = User.objects.create_superuser(
+            username="root", password="Password123!", email="root@example.com"
+        )
+        self.assertTrue(perm.has_permission(DummyRequest(superuser), None))
+
+        self.assertFalse(perm.has_permission(DummyRequest(self.employee), None))
+        self.assertFalse(perm.has_permission(DummyRequest(self.manager), None))
+
+    def test_unauthenticated_fails_all_role_permissions(self):
+        """Unauthenticated requests are denied by all role permission classes."""
+        from django.contrib.auth.models import AnonymousUser
+
+        anon = AnonymousUser()
+        for perm_class in [self.IsEmployee, self.IsManager, self.IsFinance, self.IsAdmin]:
+            self.assertFalse(perm_class().has_permission(DummyRequest(anon), None))
+
+
