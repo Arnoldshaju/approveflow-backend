@@ -1,3 +1,4 @@
+from decimal import Decimal
 from django.contrib.auth import get_user_model
 from rest_framework import status
 from rest_framework.permissions import AllowAny, IsAuthenticated
@@ -5,11 +6,13 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
 
+from approvals.models import SystemSetting
 from approvals.permissions import IsAdmin
 from .serializers import (
     AdminUserSerializer,
     LoginSerializer,
     PurchaseRequestSerializer,
+    ThresholdSettingSerializer,
 )
 
 User = get_user_model()
@@ -160,6 +163,38 @@ class AdminUserDetailAPIView(APIView):
                 status=status.HTTP_200_OK,
             )
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+class AdminThresholdAPIView(APIView):
+    permission_classes = [IsAdmin]
+
+    def get_object(self):
+        setting, _ = SystemSetting.objects.get_or_create(
+            key="approval_threshold",
+            defaults={"value": Decimal("10000.00")},
+        )
+        return setting
+
+    def get(self, request):
+        setting = self.get_object()
+        serializer = ThresholdSettingSerializer(setting)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    def put(self, request):
+        setting = self.get_object()
+        serializer = ThresholdSettingSerializer(
+            setting,
+            data=request.data,
+            context={"request": request},
+        )
+        if serializer.is_valid():
+            serializer.save()
+            return Response(serializer.data, status=status.HTTP_200_OK)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    def patch(self, request):
+        return self.put(request)
+
 
 
 

@@ -1,3 +1,4 @@
+from decimal import Decimal
 from django.conf import settings
 from django.db import models
 from django.db.models.signals import post_save
@@ -47,8 +48,37 @@ class UserProfile(models.Model):
         return f"{self.user.get_username()} ({self.role})"
 
 
+class SystemSetting(models.Model):
+    key = models.CharField(max_length=50, unique=True)
+    value = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=Decimal("10000.00"),
+    )
+    updated_at = models.DateTimeField(auto_now=True)
+    updated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="updated_settings",
+    )
+
+    def __str__(self):
+        return f"{self.key}: {self.value}"
+
+    @classmethod
+    def get_approval_threshold(cls):
+        setting, _ = cls.objects.get_or_create(
+            key="approval_threshold",
+            defaults={"value": Decimal("10000.00")},
+        )
+        return setting.value
+
+
 @receiver(post_save, sender=settings.AUTH_USER_MODEL)
 def create_or_update_user_profile(sender, instance, created, **kwargs):
     if created:
         UserProfile.objects.get_or_create(user=instance)
+
 

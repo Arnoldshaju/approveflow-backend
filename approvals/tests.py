@@ -306,4 +306,98 @@ class AdminUserManagementAPITests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
 
 
+class AdminThresholdAPITests(APITestCase):
+    def setUp(self):
+        from approvals.models import SystemSetting, UserProfile
+        from rest_framework_simplejwt.tokens import RefreshToken
+
+        self.SystemSetting = SystemSetting
+
+        # Create Admin
+        self.admin = User.objects.create_superuser(
+            username="threshold_admin",
+            password="AdminPassword123!",
+            email="threshold_admin@approveflow.com",
+        )
+        self.admin.profile.role = UserProfile.Role.ADMIN
+        self.admin.profile.save()
+        self.admin_token = str(RefreshToken.for_user(self.admin).access_token)
+
+        # Create Employee
+        self.employee = User.objects.create_user(
+            username="regular_worker",
+            password="EmpPassword123!",
+            email="worker@approveflow.com",
+        )
+        self.employee.profile.role = UserProfile.Role.EMPLOYEE
+        self.employee.profile.save()
+        self.employee_token = str(RefreshToken.for_user(self.employee).access_token)
+
+    def test_default_threshold_is_10000(self):
+        """GET /api/v1/admin/threshold/ returns the default 10,000 threshold."""
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.admin_token}")
+        response = self.client.get("/api/v1/admin/threshold/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["key"], "approval_threshold")
+        self.assertEqual(response.data["threshold"], "10000.00")
+
+    def test_admin_can_update_threshold_via_put(self):
+        """Admin can update threshold via PUT and updated_by is recorded."""
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.admin_token}")
+        response = self.client.put(
+            "/api/v1/admin/threshold/",
+            {"threshold": "15000.00"},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["threshold"], "15000.00")
+        self.assertEqual(response.data["updated_by"]["id"], self.admin.id)
+        self.assertEqual(response.data["updated_by"]["username"], "threshold_admin")
+
+        # Database verification
+        from decimal import Decimal
+        self.assertEqual(
+            self.SystemSetting.get_approval_threshold(),
+            Decimal("15000.00"),
+        )
+
+    def test_admin_can_update_threshold_via_patch(self):
+        """Admin can update threshold via PATCH."""
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.admin_token}")
+        response = self.client.patch(
+            "/api/v1/admin/threshold/",
+            {"threshold": "25000.50"},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["threshold"], "25000.50")
+
+    def test_zero_or_negative_threshold_rejected(self):
+        """Setting threshold to <= 0 returns 400 Bad Request."""
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.admin_token}")
+
+        res_zero = self.client.put("/api/v1/admin/threshold/", {"threshold": "0.00"})
+        self.assertEqual(res_zero.status_code, status.HTTP_400_BAD_REQUEST)
+
+        res_neg = self.client.put("/api/v1/admin/threshold/", {"threshold": "-500.00"})
+        self.assertEqual(res_neg.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_non_admin_forbidden_from_threshold_api(self):
+        """Employees receive 403 Forbidden when calling threshold API."""
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.employee_token}")
+
+        get_res = self.client.get("/api/v1/admin/threshold/")
+        self.assertEqual(get_res.status_code, status.HTTP_403_FORBIDDEN)
+
+        put_res = self.client.put("/api/v1/admin/threshold/", {"threshold": "20000.00"})
+        self.assertEqual(put_res.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_unauthenticated_rejected_with_401(self):
+        """Unauthenticated requests return 401 Unauthorized."""
+        response = self.client.get("/api/v1/admin/threshold/")
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+
+
 

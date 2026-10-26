@@ -6,6 +6,7 @@ from rest_framework_simplejwt.views import (
 
 from api_v1.statuses.views import StatusAPIView
 from approvals.views import (
+    AdminThresholdAPIView,
     AdminUserDetailAPIView,
     AdminUserListCreateAPIView,
     CurrentUserAPIView,
@@ -29,4 +30,6 @@ urlpatterns = [
     # Admin User & Role Management APIs
     path("admin/users/", AdminUserListCreateAPIView.as_view(), name="admin-user-list-create"),
     path("admin/users/<int:pk>/", AdminUserDetailAPIView.as_view(), name="admin-user-detail"),
+    # Admin System Threshold Configuration
+    path("admin/threshold/", AdminThresholdAPIView.as_view(), name="admin-threshold"),
 ]

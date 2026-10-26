@@ -1,7 +1,8 @@
+from decimal import Decimal
 from django.contrib.auth import authenticate, get_user_model
 from rest_framework import serializers
 
-from .models import PurchaseRequest, UserProfile
+from .models import PurchaseRequest, SystemSetting, UserProfile
 
 User = get_user_model()
 
@@ -154,3 +155,32 @@ class PurchaseRequestSerializer(serializers.ModelSerializer):
             "status",
             "created_at",
         ]
+
+
+class ThresholdSettingSerializer(serializers.Serializer):
+    key = serializers.CharField(read_only=True, default="approval_threshold")
+    threshold = serializers.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        min_value=Decimal("0.01"),
+        source="value",
+    )
+    updated_at = serializers.DateTimeField(read_only=True)
+    updated_by = serializers.SerializerMethodField()
+
+    def get_updated_by(self, obj):
+        if obj.updated_by:
+            return {
+                "id": obj.updated_by.id,
+                "username": obj.updated_by.get_username(),
+            }
+        return None
+
+    def update(self, instance, validated_data):
+        instance.value = validated_data.get("value", instance.value)
+        request = self.context.get("request")
+        if request and request.user.is_authenticated:
+            instance.updated_by = request.user
+        instance.save()
+        return instance
+
