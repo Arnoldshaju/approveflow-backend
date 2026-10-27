@@ -2,7 +2,7 @@ from decimal import Decimal
 from django.contrib.auth import authenticate, get_user_model
 from rest_framework import serializers
 
-from .models import PurchaseRequest, SystemSetting, UserProfile
+from .models import ApprovalStep, PurchaseRequest, SystemSetting, UserProfile
 
 User = get_user_model()
 
@@ -139,6 +139,44 @@ class LoginSerializer(serializers.Serializer):
 
 
 
+class ApprovalStepSerializer(serializers.ModelSerializer):
+    assigned_reviewer = serializers.SerializerMethodField()
+    decided_by = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ApprovalStep
+        fields = [
+            "id",
+            "stage",
+            "sequence",
+            "assigned_reviewer",
+            "status",
+            "is_active",
+            "decided_by",
+            "decided_at",
+            "comments",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = fields
+
+    def get_assigned_reviewer(self, obj):
+        if obj.assigned_reviewer:
+            return {
+                "id": obj.assigned_reviewer.id,
+                "username": obj.assigned_reviewer.get_username(),
+            }
+        return None
+
+    def get_decided_by(self, obj):
+        if obj.decided_by:
+            return {
+                "id": obj.decided_by.id,
+                "username": obj.decided_by.get_username(),
+            }
+        return None
+
+
 class PurchaseRequestSerializer(serializers.ModelSerializer):
     amount = serializers.DecimalField(
         max_digits=12,
@@ -146,6 +184,7 @@ class PurchaseRequestSerializer(serializers.ModelSerializer):
         min_value=Decimal("0.01"),
     )
     requester = serializers.SerializerMethodField()
+    steps = ApprovalStepSerializer(many=True, read_only=True)
 
     class Meta:
         model = PurchaseRequest
@@ -159,6 +198,7 @@ class PurchaseRequestSerializer(serializers.ModelSerializer):
             "requester",
             "applied_threshold",
             "submitted_at",
+            "steps",
             "created_at",
             "updated_at",
         ]
@@ -168,6 +208,7 @@ class PurchaseRequestSerializer(serializers.ModelSerializer):
             "requester",
             "applied_threshold",
             "submitted_at",
+            "steps",
             "created_at",
             "updated_at",
         ]

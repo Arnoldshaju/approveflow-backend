@@ -1,12 +1,14 @@
 from decimal import Decimal
 from django.contrib.auth import get_user_model
+from django.db import transaction
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
 
-from approvals.models import PurchaseRequest, SystemSetting, UserProfile
+from approvals.models import ApprovalStep, PurchaseRequest, SystemSetting, UserProfile
 from approvals.permissions import IsAdmin
 from .serializers import (
     AdminUserSerializer,
@@ -157,6 +159,87 @@ class PurchaseRequestDetailAPIView(APIView):
             {"detail": "Purchase request draft deleted successfully."},
             status=status.HTTP_204_NO_CONTENT,
         )
+
+
+class PurchaseRequestSubmitAPIView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        try:
+            pr = PurchaseRequest.objects.select_related("requester__profile__manager").get(pk=pk)
+        except PurchaseRequest.DoesNotExist:
+            return Response(
+                {"detail": "Purchase request not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        # Only the requester can submit their request
+        if pr.requester != request.user:
+            return Response(
+                {"detail": "You do not have permission to submit this request."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        # Only DRAFT requests can be submitted
+        if pr.status != PurchaseRequest.Status.DRAFT:
+            return Response(
+                {"detail": "Only draft requests can be submitted."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Requester must have an assigned manager
+        requester_profile = getattr(request.user, "profile", None)
+        if not requester_profile or not requester_profile.manager:
+            return Response(
+                {
+                    "detail": "Cannot submit request without an assigned manager. Please contact your administrator."
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        manager = requester_profile.manager
+
+        with transaction.atomic():
+            # 1. Snapshot current threshold at submission time
+            active_threshold = SystemSetting.get_approval_threshold()
+            pr.applied_threshold = active_threshold
+            pr.status = PurchaseRequest.Status.PENDING
+            pr.submitted_at = timezone.now()
+            pr.save()
+
+            # Clear any preexisting steps
+            pr.steps.all().delete()
+
+            # 2. Step 1: Manager Review (Always generated, is_active=True)
+            ApprovalStep.objects.create(
+                request=pr,
+                stage=ApprovalStep.Stage.MANAGER,
+                sequence=1,
+                assigned_reviewer=manager,
+                status=ApprovalStep.Status.PENDING,
+                is_active=True,
+            )
+
+            # 3. Step 2: Finance Review (Generated if amount > applied_threshold, is_active=False until Step 1 approves)
+            if pr.amount > active_threshold:
+                ApprovalStep.objects.create(
+                    request=pr,
+                    stage=ApprovalStep.Stage.FINANCE,
+                    sequence=2,
+                    assigned_reviewer=None,
+                    status=ApprovalStep.Status.PENDING,
+                    is_active=False,
+                )
+
+        serializer = PurchaseRequestSerializer(pr)
+        return Response(
+            {
+                "message": "Purchase request submitted successfully.",
+                "purchase_request": serializer.data,
+            },
+            status=status.HTTP_200_OK,
+        )
+
 
 class LoginAPIView(APIView):
     permission_classes = [AllowAny]

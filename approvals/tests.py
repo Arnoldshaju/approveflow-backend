@@ -618,6 +618,198 @@ class PurchaseRequestLifecycleAPITests(APITestCase):
         self.assertTrue(self.PurchaseRequest.objects.filter(id=pr.id).exists())
 
 
+class RequestSubmissionAPITests(APITestCase):
+    def setUp(self):
+        from decimal import Decimal
+        from approvals.models import ApprovalStep, PurchaseRequest, SystemSetting, UserProfile
+        from rest_framework_simplejwt.tokens import RefreshToken
+
+        self.Decimal = Decimal
+        self.PurchaseRequest = PurchaseRequest
+        self.ApprovalStep = ApprovalStep
+        self.SystemSetting = SystemSetting
+
+        # Manager
+        self.manager = User.objects.create_user(
+            username="reporting_manager",
+            password="MgrPassword123!",
+            email="manager@example.com",
+        )
+        self.manager.profile.role = UserProfile.Role.MANAGER
+        self.manager.profile.save()
+
+        # Employee with manager
+        self.employee = User.objects.create_user(
+            username="submitting_employee",
+            password="EmpPassword123!",
+            email="emp@example.com",
+        )
+        self.employee.profile.role = UserProfile.Role.EMPLOYEE
+        self.employee.profile.manager = self.manager
+        self.employee.profile.save()
+        self.emp_token = str(RefreshToken.for_user(self.employee).access_token)
+
+        # Another Employee without manager
+        self.orphan_emp = User.objects.create_user(
+            username="orphan_employee",
+            password="EmpPassword123!",
+            email="orphan@example.com",
+        )
+        self.orphan_emp.profile.role = UserProfile.Role.EMPLOYEE
+        self.orphan_emp.profile.manager = None
+        self.orphan_emp.profile.save()
+        self.orphan_token = str(RefreshToken.for_user(self.orphan_emp).access_token)
+
+        # Ensure default threshold is 10,000.00
+        SystemSetting.objects.update_or_create(
+            key="approval_threshold",
+            defaults={"value": Decimal("10000.00")},
+        )
+
+    def test_submit_below_threshold_creates_single_manager_step(self):
+        """Submitting an amount <= threshold generates only Step 1 (Manager Review)."""
+        pr = self.PurchaseRequest.objects.create(
+            requester=self.employee,
+            title="Desk Monitor",
+            amount=self.Decimal("5000.00"),
+            status=self.PurchaseRequest.Status.DRAFT,
+        )
+
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.emp_token}")
+        response = self.client.post(f"/api/v1/purchase-requests/{pr.id}/submit/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["message"], "Purchase request submitted successfully.")
+
+        # Check request in DB
+        pr.refresh_from_db()
+        self.assertEqual(pr.status, self.PurchaseRequest.Status.PENDING)
+        self.assertIsNotNone(pr.submitted_at)
+        self.assertEqual(pr.applied_threshold, self.Decimal("10000.00"))
+
+        # Verify steps: exactly 1 step
+        steps = pr.steps.all().order_by("sequence")
+        self.assertEqual(steps.count(), 1)
+        step1 = steps[0]
+        self.assertEqual(step1.sequence, 1)
+        self.assertEqual(step1.stage, self.ApprovalStep.Stage.MANAGER)
+        self.assertEqual(step1.assigned_reviewer, self.manager)
+        self.assertEqual(step1.status, self.ApprovalStep.Status.PENDING)
+        self.assertTrue(step1.is_active)
+
+    def test_submit_above_threshold_creates_manager_and_finance_steps(self):
+        """Submitting an amount > threshold generates Step 1 (Manager, active) and Step 2 (Finance, inactive)."""
+        pr = self.PurchaseRequest.objects.create(
+            requester=self.employee,
+            title="Enterprise Cloud Server",
+            amount=self.Decimal("25000.00"),
+            status=self.PurchaseRequest.Status.DRAFT,
+        )
+
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.emp_token}")
+        response = self.client.post(f"/api/v1/purchase-requests/{pr.id}/submit/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        # Check request
+        pr.refresh_from_db()
+        self.assertEqual(pr.status, self.PurchaseRequest.Status.PENDING)
+        self.assertEqual(pr.applied_threshold, self.Decimal("10000.00"))
+
+        # Verify steps: 2 steps
+        steps = pr.steps.all().order_by("sequence")
+        self.assertEqual(steps.count(), 2)
+
+        # Step 1: Manager Review (active)
+        step1 = steps[0]
+        self.assertEqual(step1.sequence, 1)
+        self.assertEqual(step1.stage, self.ApprovalStep.Stage.MANAGER)
+        self.assertEqual(step1.assigned_reviewer, self.manager)
+        self.assertTrue(step1.is_active)
+
+        # Step 2: Finance Review (inactive until Step 1 approves)
+        step2 = steps[1]
+        self.assertEqual(step2.sequence, 2)
+        self.assertEqual(step2.stage, self.ApprovalStep.Stage.FINANCE)
+        self.assertIsNone(step2.assigned_reviewer)
+        self.assertFalse(step2.is_active)
+
+    def test_submit_without_assigned_manager_fails(self):
+        """Submitting without an assigned manager returns 400 Bad Request."""
+        pr = self.PurchaseRequest.objects.create(
+            requester=self.orphan_emp,
+            title="Orphan Request",
+            amount=self.Decimal("1000.00"),
+            status=self.PurchaseRequest.Status.DRAFT,
+        )
+
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.orphan_token}")
+        response = self.client.post(f"/api/v1/purchase-requests/{pr.id}/submit/")
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("manager", response.data["detail"].lower())
+
+        # Request remains in draft
+        pr.refresh_from_db()
+        self.assertEqual(pr.status, self.PurchaseRequest.Status.DRAFT)
+        self.assertEqual(pr.steps.count(), 0)
+
+    def test_submit_already_submitted_request_fails(self):
+        """Submitting a request that is not in DRAFT status returns 400 Bad Request."""
+        pr = self.PurchaseRequest.objects.create(
+            requester=self.employee,
+            title="Already Pending Request",
+            amount=self.Decimal("1000.00"),
+            status=self.PurchaseRequest.Status.PENDING,
+        )
+
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.emp_token}")
+        response = self.client.post(f"/api/v1/purchase-requests/{pr.id}/submit/")
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("Only draft requests can be submitted", response.data["detail"])
+
+    def test_submit_others_request_forbidden(self):
+        """Submitting another user's request returns 403 Forbidden."""
+        pr = self.PurchaseRequest.objects.create(
+            requester=self.employee,
+            title="Employee 1 Request",
+            amount=self.Decimal("1000.00"),
+            status=self.PurchaseRequest.Status.DRAFT,
+        )
+
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.orphan_token}")
+        response = self.client.post(f"/api/v1/purchase-requests/{pr.id}/submit/")
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_policy_stability_snapshot_preserves_submission_threshold(self):
+        """Threshold changes after submission do not alter applied_threshold on existing requests."""
+        pr = self.PurchaseRequest.objects.create(
+            requester=self.employee,
+            title="Snapshot Request",
+            amount=self.Decimal("8000.00"),
+            status=self.PurchaseRequest.Status.DRAFT,
+        )
+
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.emp_token}")
+        self.client.post(f"/api/v1/purchase-requests/{pr.id}/submit/")
+
+        pr.refresh_from_db()
+        self.assertEqual(pr.applied_threshold, self.Decimal("10000.00"))
+
+        # Admin changes system threshold to 5,000.00
+        setting = self.SystemSetting.objects.get(key="approval_threshold")
+        setting.value = self.Decimal("5000.00")
+        setting.save()
+
+        # The previously submitted request still has 10,000.00 applied_threshold and 1 step
+        pr.refresh_from_db()
+        self.assertEqual(pr.applied_threshold, self.Decimal("10000.00"))
+        self.assertEqual(pr.steps.count(), 1)
+
+
+
 
 
 

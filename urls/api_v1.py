@@ -15,6 +15,7 @@ from approvals.views import (
     PurchaseRequestCreateAPIView,
     PurchaseRequestDetailAPIView,
     PurchaseRequestListCreateAPIView,
+    PurchaseRequestSubmitAPIView,
 )
 
 urlpatterns = [
@@ -29,6 +30,11 @@ urlpatterns = [
         "purchase-requests/<int:pk>/",
         PurchaseRequestDetailAPIView.as_view(),
         name="purchase-request-detail",
+    ),
+    path(
+        "purchase-requests/<int:pk>/submit/",
+        PurchaseRequestSubmitAPIView.as_view(),
+        name="purchase-request-submit",
     ),
     path("token/", TokenObtainPairView.as_view(), name="token-obtain-pair"),
     path("token/refresh/", TokenRefreshView.as_view(), name="token-refresh"),

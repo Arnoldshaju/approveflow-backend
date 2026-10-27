@@ -124,6 +124,68 @@ class SystemSetting(models.Model):
         return setting.value
 
 
+class ApprovalStep(models.Model):
+    class Stage(models.TextChoices):
+        MANAGER = "MANAGER", "Manager Review"
+        FINANCE = "FINANCE", "Finance Review"
+
+    class Status(models.TextChoices):
+        PENDING = "PENDING", "Pending"
+        APPROVED = "APPROVED", "Approved"
+        REJECTED = "REJECTED", "Rejected"
+        SKIPPED = "SKIPPED", "Skipped"
+
+    request = models.ForeignKey(
+        PurchaseRequest,
+        on_delete=models.CASCADE,
+        related_name="steps",
+    )
+    stage = models.CharField(
+        max_length=20,
+        choices=Stage.choices,
+    )
+    sequence = models.PositiveIntegerField(default=1)
+    assigned_reviewer = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="assigned_approval_steps",
+    )
+    status = models.CharField(
+        max_length=20,
+        choices=Status.choices,
+        default=Status.PENDING,
+    )
+    is_active = models.BooleanField(
+        default=False,
+        help_text="True if this step is currently pending action from the reviewer.",
+    )
+    decided_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="decided_approval_steps",
+    )
+    decided_at = models.DateTimeField(null=True, blank=True)
+    comments = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["sequence"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["request", "sequence"],
+                name="unique_step_per_request_sequence",
+            ),
+        ]
+
+    def __str__(self):
+        return f"Request #{self.request_id} - Step {self.sequence} ({self.stage}): {self.status}"
+
+
 @receiver(post_save, sender=settings.AUTH_USER_MODEL)
 def create_or_update_user_profile(sender, instance, created, **kwargs):
     if created:
