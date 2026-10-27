@@ -13,6 +13,8 @@ from approvals.views import (
     HealthCheckAPIView,
     LoginAPIView,
     PurchaseRequestCreateAPIView,
+    PurchaseRequestDetailAPIView,
+    PurchaseRequestListCreateAPIView,
 )
 
 urlpatterns = [
@@ -20,8 +22,13 @@ urlpatterns = [
     path("statuses/", StatusAPIView.as_view(), name="statuses"),
     path(
         "purchase-requests/",
-        PurchaseRequestCreateAPIView.as_view(),
-        name="create-purchase-request",
+        PurchaseRequestListCreateAPIView.as_view(),
+        name="purchase-request-list-create",
+    ),
+    path(
+        "purchase-requests/<int:pk>/",
+        PurchaseRequestDetailAPIView.as_view(),
+        name="purchase-request-detail",
     ),
     path("token/", TokenObtainPairView.as_view(), name="token-obtain-pair"),
     path("token/refresh/", TokenRefreshView.as_view(), name="token-refresh"),

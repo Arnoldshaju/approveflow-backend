@@ -6,7 +6,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
 
-from approvals.models import SystemSetting
+from approvals.models import PurchaseRequest, SystemSetting, UserProfile
 from approvals.permissions import IsAdmin
 from .serializers import (
     AdminUserSerializer,
@@ -30,22 +30,132 @@ class HealthCheckAPIView(APIView):
         })
 
 
-class PurchaseRequestCreateAPIView(APIView):
-
-    def post(self, request):
-        serializer = PurchaseRequestSerializer(data=request.data)
-
-        if serializer.is_valid():
-            purchase_request = serializer.save()
-
-            return Response(
-                PurchaseRequestSerializer(purchase_request).data,
-                status=status.HTTP_201_CREATED,
+class PurchaseRequestListCreateAPIView(APIView):
+    def get(self, request):
+        if request.user.is_superuser or (
+            hasattr(request.user, "profile")
+            and request.user.profile.role == UserProfile.Role.ADMIN
+        ):
+            requests = (
+                PurchaseRequest.objects.all()
+                .select_related("requester")
+                .order_by("-created_at")
+            )
+        else:
+            requests = (
+                PurchaseRequest.objects.filter(requester=request.user)
+                .select_related("requester")
+                .order_by("-created_at")
             )
 
+        serializer = PurchaseRequestSerializer(requests, many=True)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    def post(self, request):
+        serializer = PurchaseRequestSerializer(
+            data=request.data,
+            context={"request": request},
+        )
+        if serializer.is_valid():
+            serializer.save()
+            return Response(
+                serializer.data,
+                status=status.HTTP_201_CREATED,
+            )
         return Response(
             serializer.errors,
             status=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+PurchaseRequestCreateAPIView = PurchaseRequestListCreateAPIView
+
+
+class PurchaseRequestDetailAPIView(APIView):
+    def get_object(self, pk):
+        try:
+            return PurchaseRequest.objects.select_related("requester").get(pk=pk)
+        except PurchaseRequest.DoesNotExist:
+            return None
+
+    def get(self, request, pk):
+        pr = self.get_object(pk)
+        if not pr:
+            return Response(
+                {"detail": "Purchase request not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        is_admin = request.user.is_superuser or (
+            hasattr(request.user, "profile")
+            and request.user.profile.role == UserProfile.Role.ADMIN
+        )
+        if pr.requester != request.user and not is_admin:
+            return Response(
+                {"detail": "You do not have permission to view this request."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        return Response(PurchaseRequestSerializer(pr).data, status=status.HTTP_200_OK)
+
+    def patch(self, request, pk):
+        pr = self.get_object(pk)
+        if not pr:
+            return Response(
+                {"detail": "Purchase request not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        is_admin = request.user.is_superuser or (
+            hasattr(request.user, "profile")
+            and request.user.profile.role == UserProfile.Role.ADMIN
+        )
+        if pr.requester != request.user and not is_admin:
+            return Response(
+                {"detail": "You do not have permission to edit this request."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        serializer = PurchaseRequestSerializer(
+            pr,
+            data=request.data,
+            partial=True,
+            context={"request": request},
+        )
+        if serializer.is_valid():
+            serializer.save()
+            return Response(serializer.data, status=status.HTTP_200_OK)
+
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    def delete(self, request, pk):
+        pr = self.get_object(pk)
+        if not pr:
+            return Response(
+                {"detail": "Purchase request not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        is_admin = request.user.is_superuser or (
+            hasattr(request.user, "profile")
+            and request.user.profile.role == UserProfile.Role.ADMIN
+        )
+        if pr.requester != request.user and not is_admin:
+            return Response(
+                {"detail": "You do not have permission to delete this request."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        if pr.status != PurchaseRequest.Status.DRAFT:
+            return Response(
+                {"detail": "Only draft requests can be deleted."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        pr.delete()
+        return Response(
+            {"detail": "Purchase request draft deleted successfully."},
+            status=status.HTTP_204_NO_CONTENT,
         )
 
 class LoginAPIView(APIView):

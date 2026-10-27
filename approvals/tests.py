@@ -399,5 +399,225 @@ class AdminThresholdAPITests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
 
 
+class PurchaseRequestLifecycleAPITests(APITestCase):
+    def setUp(self):
+        from approvals.models import PurchaseRequest, UserProfile
+        from rest_framework_simplejwt.tokens import RefreshToken
+
+        self.PurchaseRequest = PurchaseRequest
+
+        # Employee 1
+        self.emp1 = User.objects.create_user(
+            username="requester_one",
+            password="EmpPassword123!",
+            email="emp1@example.com",
+        )
+        self.emp1.profile.role = UserProfile.Role.EMPLOYEE
+        self.emp1.profile.save()
+        self.emp1_token = str(RefreshToken.for_user(self.emp1).access_token)
+
+        # Employee 2
+        self.emp2 = User.objects.create_user(
+            username="requester_two",
+            password="EmpPassword123!",
+            email="emp2@example.com",
+        )
+        self.emp2.profile.role = UserProfile.Role.EMPLOYEE
+        self.emp2.profile.save()
+        self.emp2_token = str(RefreshToken.for_user(self.emp2).access_token)
+
+        # Admin
+        self.admin = User.objects.create_user(
+            username="super_admin",
+            password="AdminPassword123!",
+            email="admin@example.com",
+        )
+        self.admin.profile.role = UserProfile.Role.ADMIN
+        self.admin.profile.save()
+        self.admin_token = str(RefreshToken.for_user(self.admin).access_token)
+
+    def test_employee_creates_draft_purchase_request(self):
+        """Creating a purchase request defaults to DRAFT status and sets requester to the user."""
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.emp1_token}")
+        response = self.client.post(
+            "/api/v1/purchase-requests/",
+            {
+                "title": "MacBook Pro M3",
+                "category": "HARDWARE",
+                "amount": "2499.99",
+                "description": "Upgraded development laptop.",
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data["status"], "DRAFT")
+        self.assertEqual(response.data["title"], "MacBook Pro M3")
+        self.assertEqual(response.data["category"], "HARDWARE")
+        self.assertEqual(response.data["amount"], "2499.99")
+        self.assertEqual(response.data["requester"]["id"], self.emp1.id)
+        self.assertEqual(response.data["requester"]["username"], "requester_one")
+
+        # Database verification
+        req_id = response.data["id"]
+        pr = self.PurchaseRequest.objects.get(id=req_id)
+        self.assertEqual(pr.requester, self.emp1)
+        self.assertEqual(pr.status, self.PurchaseRequest.Status.DRAFT)
+
+    def test_employee_lists_own_requests_only(self):
+        """Employees only see their own purchase requests in the list endpoint."""
+        self.PurchaseRequest.objects.create(
+            requester=self.emp1,
+            title="Desk Monitor",
+            category="HARDWARE",
+            amount="350.00",
+        )
+        self.PurchaseRequest.objects.create(
+            requester=self.emp2,
+            title="Office Chair",
+            category="OFFICE_SUPPLIES",
+            amount="450.00",
+        )
+
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.emp1_token}")
+        response = self.client.get("/api/v1/purchase-requests/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]["title"], "Desk Monitor")
+
+    def test_admin_lists_all_requests(self):
+        """Admin users see all purchase requests across the organization."""
+        self.PurchaseRequest.objects.create(
+            requester=self.emp1,
+            title="Emp1 Monitor",
+            amount="300.00",
+        )
+        self.PurchaseRequest.objects.create(
+            requester=self.emp2,
+            title="Emp2 Keyboard",
+            amount="120.00",
+        )
+
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.admin_token}")
+        response = self.client.get("/api/v1/purchase-requests/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 2)
+
+    def test_employee_can_view_own_detail(self):
+        """Employee can retrieve the detail of their own purchase request."""
+        pr = self.PurchaseRequest.objects.create(
+            requester=self.emp1,
+            title="Software IDE License",
+            category="SOFTWARE",
+            amount="199.00",
+        )
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.emp1_token}")
+        response = self.client.get(f"/api/v1/purchase-requests/{pr.id}/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["id"], pr.id)
+        self.assertEqual(response.data["title"], "Software IDE License")
+
+    def test_employee_forbidden_from_viewing_others_request(self):
+        """Employee cannot retrieve another employee's purchase request detail."""
+        pr = self.PurchaseRequest.objects.create(
+            requester=self.emp1,
+            title="Confidential Expense",
+            amount="500.00",
+        )
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.emp2_token}")
+        response = self.client.get(f"/api/v1/purchase-requests/{pr.id}/")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_employee_can_edit_draft_request_via_patch(self):
+        """Employee can update fields of their draft request."""
+        pr = self.PurchaseRequest.objects.create(
+            requester=self.emp1,
+            title="Rough Draft Request",
+            amount="100.00",
+            status=self.PurchaseRequest.Status.DRAFT,
+        )
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.emp1_token}")
+        response = self.client.patch(
+            f"/api/v1/purchase-requests/{pr.id}/",
+            {"title": "Final Draft Request", "amount": "250.00"},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["title"], "Final Draft Request")
+        self.assertEqual(response.data["amount"], "250.00")
+
+    def test_editing_locked_when_not_draft(self):
+        """Attempting to edit a submitted or pending request returns 400 Bad Request."""
+        pr = self.PurchaseRequest.objects.create(
+            requester=self.emp1,
+            title="Submitted Request",
+            amount="1000.00",
+            status=self.PurchaseRequest.Status.PENDING,
+        )
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.emp1_token}")
+        response = self.client.patch(
+            f"/api/v1/purchase-requests/{pr.id}/",
+            {"amount": "1200.00"},
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("detail", response.data)
+        self.assertIn("Only draft requests can be edited", str(response.data["detail"]))
+
+    def test_employee_forbidden_from_editing_others_request(self):
+        """Employee cannot edit another employee's request."""
+        pr = self.PurchaseRequest.objects.create(
+            requester=self.emp1,
+            title="Emp1 Request",
+            amount="100.00",
+            status=self.PurchaseRequest.Status.DRAFT,
+        )
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.emp2_token}")
+        response = self.client.patch(
+            f"/api/v1/purchase-requests/{pr.id}/",
+            {"amount": "500.00"},
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_zero_or_negative_amount_rejected(self):
+        """Creating a purchase request with amount <= 0 returns 400 Bad Request."""
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.emp1_token}")
+
+        res_zero = self.client.post(
+            "/api/v1/purchase-requests/",
+            {"title": "Zero Item", "amount": "0.00"},
+        )
+        self.assertEqual(res_zero.status_code, status.HTTP_400_BAD_REQUEST)
+
+        res_neg = self.client.post(
+            "/api/v1/purchase-requests/",
+            {"title": "Negative Item", "amount": "-50.00"},
+        )
+        self.assertEqual(res_neg.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_employee_can_delete_draft_request(self):
+        """Employee can delete their own draft request."""
+        pr = self.PurchaseRequest.objects.create(
+            requester=self.emp1,
+            title="Draft to Delete",
+            amount="100.00",
+            status=self.PurchaseRequest.Status.DRAFT,
+        )
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.emp1_token}")
+        response = self.client.delete(f"/api/v1/purchase-requests/{pr.id}/")
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(self.PurchaseRequest.objects.filter(id=pr.id).exists())
+
+    def test_deleting_non_draft_request_rejected(self):
+        """Deleting a request that is not in DRAFT status returns 400 Bad Request."""
+        pr = self.PurchaseRequest.objects.create(
+            requester=self.emp1,
+            title="In Flight Request",
+            amount="100.00",
+            status=self.PurchaseRequest.Status.PENDING,
+        )
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.emp1_token}")
+        response = self.client.delete(f"/api/v1/purchase-requests/{pr.id}/")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertTrue(self.PurchaseRequest.objects.filter(id=pr.id).exists())
+
+
+
 
 

@@ -140,21 +140,60 @@ class LoginSerializer(serializers.Serializer):
 
 
 class PurchaseRequestSerializer(serializers.ModelSerializer):
+    amount = serializers.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        min_value=Decimal("0.01"),
+    )
+    requester = serializers.SerializerMethodField()
+
     class Meta:
         model = PurchaseRequest
         fields = [
             "id",
             "title",
+            "category",
             "amount",
             "description",
             "status",
+            "requester",
+            "applied_threshold",
+            "submitted_at",
             "created_at",
+            "updated_at",
         ]
         read_only_fields = [
             "id",
             "status",
+            "requester",
+            "applied_threshold",
+            "submitted_at",
             "created_at",
+            "updated_at",
         ]
+
+    def get_requester(self, obj):
+        if obj.requester:
+            return {
+                "id": obj.requester.id,
+                "username": obj.requester.get_username(),
+            }
+        return None
+
+    def validate(self, attrs):
+        if self.instance and self.instance.status != PurchaseRequest.Status.DRAFT:
+            raise serializers.ValidationError(
+                {"detail": "Only draft requests can be edited. Submitted requests are locked."}
+            )
+        return attrs
+
+    def create(self, validated_data):
+        request = self.context.get("request")
+        if request and request.user.is_authenticated:
+            validated_data["requester"] = request.user
+        validated_data["status"] = PurchaseRequest.Status.DRAFT
+        return super().create(validated_data)
+
 
 
 class ThresholdSettingSerializer(serializers.Serializer):

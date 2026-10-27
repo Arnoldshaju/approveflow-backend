@@ -6,14 +6,62 @@ from django.dispatch import receiver
 
 
 class PurchaseRequest(models.Model):
+    class Status(models.TextChoices):
+        DRAFT = "DRAFT", "Draft"
+        PENDING = "PENDING", "Pending Approval"
+        APPROVED = "APPROVED", "Approved"
+        REJECTED = "REJECTED", "Rejected"
+        CANCELLED = "CANCELLED", "Cancelled"
+
+    class Category(models.TextChoices):
+        HARDWARE = "HARDWARE", "Hardware"
+        SOFTWARE = "SOFTWARE", "Software License"
+        TRAVEL = "TRAVEL", "Travel & Expense"
+        OFFICE_SUPPLIES = "OFFICE_SUPPLIES", "Office Supplies"
+        OTHER = "OTHER", "Other"
+
+    requester = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="purchase_requests",
+        null=True,
+        blank=True,
+        help_text="The employee who created this request.",
+    )
     title = models.CharField(max_length=200)
-    amount = models.DecimalField(max_digits=10, decimal_places=2)
+    category = models.CharField(
+        max_length=50,
+        choices=Category.choices,
+        default=Category.OTHER,
+    )
+    amount = models.DecimalField(max_digits=12, decimal_places=2)
     description = models.TextField(blank=True)
-    status = models.CharField(max_length=20, default="pending")
+    status = models.CharField(
+        max_length=20,
+        choices=Status.choices,
+        default=Status.DRAFT,
+    )
+    applied_threshold = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        help_text="Threshold captured at submission time for policy stability.",
+    )
+    submitted_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.CheckConstraint(
+                check=models.Q(amount__gt=0),
+                name="positive_purchase_request_amount",
+            ),
+        ]
 
     def __str__(self):
-        return self.title
+        return f"{self.title} (₹{self.amount}) - {self.status}"
 
 
 class UserProfile(models.Model):
