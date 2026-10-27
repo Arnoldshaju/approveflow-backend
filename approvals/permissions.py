@@ -50,3 +50,20 @@ class IsAdmin(BasePermission):
             hasattr(request.user, "profile")
             and request.user.profile.role == UserProfile.Role.ADMIN
         )
+
+
+class IsReviewerOrAdmin(BasePermission):
+    """Allows access to users with MANAGER, FINANCE, or ADMIN roles, or superusers."""
+
+    def has_permission(self, request, view):
+        if not (request.user and request.user.is_authenticated):
+            return False
+        if request.user.is_superuser or request.user.is_staff:
+            return True
+        if not hasattr(request.user, "profile"):
+            return False
+        return request.user.profile.role in [
+            UserProfile.Role.MANAGER,
+            UserProfile.Role.FINANCE,
+            UserProfile.Role.ADMIN,
+        ]

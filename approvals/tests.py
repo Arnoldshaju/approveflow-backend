@@ -809,6 +809,308 @@ class RequestSubmissionAPITests(APITestCase):
         self.assertEqual(pr.steps.count(), 1)
 
 
+class ApprovalDecisionAPITests(APITestCase):
+    def setUp(self):
+        from decimal import Decimal
+        from approvals.models import ApprovalStep, PurchaseRequest, SystemSetting, UserProfile
+        from rest_framework_simplejwt.tokens import RefreshToken
+
+        self.Decimal = Decimal
+        self.PurchaseRequest = PurchaseRequest
+        self.ApprovalStep = ApprovalStep
+        self.SystemSetting = SystemSetting
+
+        # Manager 1
+        self.mgr1 = User.objects.create_user(
+            username="mgr_alice",
+            password="Password123!",
+            email="alice@example.com",
+        )
+        self.mgr1.profile.role = UserProfile.Role.MANAGER
+        self.mgr1.profile.save()
+        self.mgr1_token = str(RefreshToken.for_user(self.mgr1).access_token)
+
+        # Manager 2
+        self.mgr2 = User.objects.create_user(
+            username="mgr_bob",
+            password="Password123!",
+            email="bob@example.com",
+        )
+        self.mgr2.profile.role = UserProfile.Role.MANAGER
+        self.mgr2.profile.save()
+        self.mgr2_token = str(RefreshToken.for_user(self.mgr2).access_token)
+
+        # Finance Reviewer
+        self.fin_user = User.objects.create_user(
+            username="fin_carol",
+            password="Password123!",
+            email="carol@example.com",
+        )
+        self.fin_user.profile.role = UserProfile.Role.FINANCE
+        self.fin_user.profile.save()
+        self.fin_token = str(RefreshToken.for_user(self.fin_user).access_token)
+
+        # Employee assigned to Manager 1
+        self.emp = User.objects.create_user(
+            username="emp_dave",
+            password="Password123!",
+            email="dave@example.com",
+        )
+        self.emp.profile.role = UserProfile.Role.EMPLOYEE
+        self.emp.profile.manager = self.mgr1
+        self.emp.profile.save()
+        self.emp_token = str(RefreshToken.for_user(self.emp).access_token)
+
+        # Ensure default threshold is 10,000.00
+        SystemSetting.objects.update_or_create(
+            key="approval_threshold",
+            defaults={"value": Decimal("10000.00")},
+        )
+
+    def test_manager_views_pending_queue(self):
+        """Manager only sees active pending steps assigned to them."""
+        # Request 1: assigned to mgr1
+        pr1 = self.PurchaseRequest.objects.create(
+            requester=self.emp,
+            title="Laptop",
+            amount=self.Decimal("2000.00"),
+            status=self.PurchaseRequest.Status.DRAFT,
+        )
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.emp_token}")
+        self.client.post(f"/api/v1/purchase-requests/{pr1.id}/submit/")
+
+        # Request 2: step assigned to mgr2 directly
+        pr2 = self.PurchaseRequest.objects.create(
+            requester=self.emp,
+            title="Desk",
+            amount=self.Decimal("500.00"),
+            status=self.PurchaseRequest.Status.PENDING,
+        )
+        self.ApprovalStep.objects.create(
+            request=pr2,
+            stage=self.ApprovalStep.Stage.MANAGER,
+            sequence=1,
+            assigned_reviewer=self.mgr2,
+            status=self.ApprovalStep.Status.PENDING,
+            is_active=True,
+        )
+
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.mgr1_token}")
+        response = self.client.get("/api/v1/approvals/pending/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]["request_title"], "Laptop")
+
+    def test_employee_forbidden_from_pending_queue(self):
+        """Standard employees cannot access the pending approvals queue."""
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.emp_token}")
+        response = self.client.get("/api/v1/approvals/pending/")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_manager_approves_single_step_request(self):
+        """Approving the only step transitions the purchase request to APPROVED."""
+        pr = self.PurchaseRequest.objects.create(
+            requester=self.emp,
+            title="Monitor",
+            amount=self.Decimal("3000.00"),
+            status=self.PurchaseRequest.Status.DRAFT,
+        )
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.emp_token}")
+        self.client.post(f"/api/v1/purchase-requests/{pr.id}/submit/")
+
+        step = pr.steps.get(sequence=1)
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.mgr1_token}")
+        response = self.client.post(
+            f"/api/v1/approvals/steps/{step.id}/approve/",
+            {"comments": "Approved for remote setup."},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["request_status"], "APPROVED")
+
+        # Database checks
+        step.refresh_from_db()
+        self.assertEqual(step.status, self.ApprovalStep.Status.APPROVED)
+        self.assertFalse(step.is_active)
+        self.assertEqual(step.decided_by, self.mgr1)
+        self.assertEqual(step.comments, "Approved for remote setup.")
+
+        pr.refresh_from_db()
+        self.assertEqual(pr.status, self.PurchaseRequest.Status.APPROVED)
+
+    def test_manager_approves_multi_step_request_activates_finance(self):
+        """Approving Step 1 in a multi-step request activates Step 2 (Finance)."""
+        pr = self.PurchaseRequest.objects.create(
+            requester=self.emp,
+            title="High-End Workstation",
+            amount=self.Decimal("25000.00"),
+            status=self.PurchaseRequest.Status.DRAFT,
+        )
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.emp_token}")
+        self.client.post(f"/api/v1/purchase-requests/{pr.id}/submit/")
+
+        step1 = pr.steps.get(sequence=1)
+        step2 = pr.steps.get(sequence=2)
+        self.assertTrue(step1.is_active)
+        self.assertFalse(step2.is_active)
+
+        # Manager approves step 1
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.mgr1_token}")
+        response = self.client.post(
+            f"/api/v1/approvals/steps/{step1.id}/approve/",
+            {"comments": "Looks good from manager side."},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["request_status"], "PENDING")
+
+        # Step 1 should now be approved and inactive
+        step1.refresh_from_db()
+        self.assertEqual(step1.status, self.ApprovalStep.Status.APPROVED)
+        self.assertFalse(step1.is_active)
+
+        # Step 2 (Finance) should now be active!
+        step2.refresh_from_db()
+        self.assertTrue(step2.is_active)
+        self.assertEqual(step2.status, self.ApprovalStep.Status.PENDING)
+
+        # Request status remains PENDING
+        pr.refresh_from_db()
+        self.assertEqual(pr.status, self.PurchaseRequest.Status.PENDING)
+
+    def test_finance_approves_step_2_completes_request(self):
+        """Finance member approving Step 2 marks the entire purchase request APPROVED."""
+        pr = self.PurchaseRequest.objects.create(
+            requester=self.emp,
+            title="Workstation",
+            amount=self.Decimal("30000.00"),
+            status=self.PurchaseRequest.Status.DRAFT,
+        )
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.emp_token}")
+        self.client.post(f"/api/v1/purchase-requests/{pr.id}/submit/")
+
+        step1 = pr.steps.get(sequence=1)
+        step2 = pr.steps.get(sequence=2)
+
+        # Manager approves Step 1
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.mgr1_token}")
+        self.client.post(f"/api/v1/approvals/steps/{step1.id}/approve/")
+
+        # Finance approves Step 2
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.fin_token}")
+        response = self.client.post(
+            f"/api/v1/approvals/steps/{step2.id}/approve/",
+            {"comments": "Finance budget verified."},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["request_status"], "APPROVED")
+
+        # Final DB checks
+        step2.refresh_from_db()
+        self.assertEqual(step2.status, self.ApprovalStep.Status.APPROVED)
+        self.assertEqual(step2.decided_by, self.fin_user)
+
+        pr.refresh_from_db()
+        self.assertEqual(pr.status, self.PurchaseRequest.Status.APPROVED)
+
+    def test_manager_rejects_step_with_mandatory_comment(self):
+        """Rejecting a step marks it REJECTED, skips subsequent steps, and marks request REJECTED."""
+        pr = self.PurchaseRequest.objects.create(
+            requester=self.emp,
+            title="Luxury Chair",
+            amount=self.Decimal("15000.00"),
+            status=self.PurchaseRequest.Status.DRAFT,
+        )
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.emp_token}")
+        self.client.post(f"/api/v1/purchase-requests/{pr.id}/submit/")
+
+        step1 = pr.steps.get(sequence=1)
+        step2 = pr.steps.get(sequence=2)
+
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.mgr1_token}")
+        response = self.client.post(
+            f"/api/v1/approvals/steps/{step1.id}/reject/",
+            {"comments": "Item cost exceeds department travel and equipment policy."},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["request_status"], "REJECTED")
+
+        # Step 1 is rejected
+        step1.refresh_from_db()
+        self.assertEqual(step1.status, self.ApprovalStep.Status.REJECTED)
+        self.assertFalse(step1.is_active)
+        self.assertEqual(step1.comments, "Item cost exceeds department travel and equipment policy.")
+
+        # Step 2 is SKIPPED
+        step2.refresh_from_db()
+        self.assertEqual(step2.status, self.ApprovalStep.Status.SKIPPED)
+        self.assertFalse(step2.is_active)
+
+        # Entire request is REJECTED
+        pr.refresh_from_db()
+        self.assertEqual(pr.status, self.PurchaseRequest.Status.REJECTED)
+
+    def test_rejection_without_comment_rejected_with_400(self):
+        """Rejecting without providing a reason returns 400 Bad Request."""
+        pr = self.PurchaseRequest.objects.create(
+            requester=self.emp,
+            title="Desk",
+            amount=self.Decimal("2000.00"),
+            status=self.PurchaseRequest.Status.DRAFT,
+        )
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.emp_token}")
+        self.client.post(f"/api/v1/purchase-requests/{pr.id}/submit/")
+
+        step1 = pr.steps.get(sequence=1)
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.mgr1_token}")
+
+        # Blank comments
+        res1 = self.client.post(f"/api/v1/approvals/steps/{step1.id}/reject/", {"comments": "   "})
+        self.assertEqual(res1.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("required", res1.data["detail"].lower())
+
+        # Missing comments key
+        res2 = self.client.post(f"/api/v1/approvals/steps/{step1.id}/reject/", {})
+        self.assertEqual(res2.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_unauthorized_manager_forbidden(self):
+        """A manager not assigned to the step receives 403 Forbidden."""
+        pr = self.PurchaseRequest.objects.create(
+            requester=self.emp,
+            title="Headphones",
+            amount=self.Decimal("200.00"),
+            status=self.PurchaseRequest.Status.DRAFT,
+        )
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.emp_token}")
+        self.client.post(f"/api/v1/purchase-requests/{pr.id}/submit/")
+
+        step1 = pr.steps.get(sequence=1)
+        # mgr2 tries to approve mgr1's step
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.mgr2_token}")
+        response = self.client.post(f"/api/v1/approvals/steps/{step1.id}/approve/")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_inactive_step_cannot_be_approved(self):
+        """Attempting to approve an inactive step (e.g. Finance step before Manager) returns 400."""
+        pr = self.PurchaseRequest.objects.create(
+            requester=self.emp,
+            title="Server",
+            amount=self.Decimal("30000.00"),
+            status=self.PurchaseRequest.Status.DRAFT,
+        )
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.emp_token}")
+        self.client.post(f"/api/v1/purchase-requests/{pr.id}/submit/")
+
+        step2 = pr.steps.get(sequence=2)
+        # Finance user tries to jump the gun and approve Step 2 while it's still inactive
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.fin_token}")
+        response = self.client.post(f"/api/v1/approvals/steps/{step2.id}/approve/")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+
 
 
 

@@ -142,11 +142,24 @@ class LoginSerializer(serializers.Serializer):
 class ApprovalStepSerializer(serializers.ModelSerializer):
     assigned_reviewer = serializers.SerializerMethodField()
     decided_by = serializers.SerializerMethodField()
+    request_id = serializers.IntegerField(source="request.id", read_only=True)
+    request_title = serializers.CharField(source="request.title", read_only=True)
+    request_amount = serializers.DecimalField(
+        source="request.amount",
+        max_digits=12,
+        decimal_places=2,
+        read_only=True,
+    )
+    requester = serializers.SerializerMethodField()
 
     class Meta:
         model = ApprovalStep
         fields = [
             "id",
+            "request_id",
+            "request_title",
+            "request_amount",
+            "requester",
             "stage",
             "sequence",
             "assigned_reviewer",
@@ -173,6 +186,14 @@ class ApprovalStepSerializer(serializers.ModelSerializer):
             return {
                 "id": obj.decided_by.id,
                 "username": obj.decided_by.get_username(),
+            }
+        return None
+
+    def get_requester(self, obj):
+        if obj.request and obj.request.requester:
+            return {
+                "id": obj.request.requester.id,
+                "username": obj.request.requester.get_username(),
             }
         return None
 

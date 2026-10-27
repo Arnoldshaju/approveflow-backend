@@ -9,9 +9,10 @@ from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from approvals.models import ApprovalStep, PurchaseRequest, SystemSetting, UserProfile
-from approvals.permissions import IsAdmin
+from approvals.permissions import IsAdmin, IsReviewerOrAdmin
 from .serializers import (
     AdminUserSerializer,
+    ApprovalStepSerializer,
     LoginSerializer,
     PurchaseRequestSerializer,
     ThresholdSettingSerializer,
@@ -236,6 +237,186 @@ class PurchaseRequestSubmitAPIView(APIView):
             {
                 "message": "Purchase request submitted successfully.",
                 "purchase_request": serializer.data,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class PendingApprovalsAPIView(APIView):
+    permission_classes = [IsAuthenticated, IsReviewerOrAdmin]
+
+    def get(self, request):
+        user = request.user
+        role = getattr(getattr(user, "profile", None), "role", None)
+
+        if user.is_superuser or role == UserProfile.Role.ADMIN:
+            steps = ApprovalStep.objects.filter(
+                is_active=True,
+                status=ApprovalStep.Status.PENDING,
+            )
+        elif role == UserProfile.Role.MANAGER:
+            steps = ApprovalStep.objects.filter(
+                is_active=True,
+                status=ApprovalStep.Status.PENDING,
+                stage=ApprovalStep.Stage.MANAGER,
+                assigned_reviewer=user,
+            )
+        elif role == UserProfile.Role.FINANCE:
+            steps = ApprovalStep.objects.filter(
+                is_active=True,
+                status=ApprovalStep.Status.PENDING,
+                stage=ApprovalStep.Stage.FINANCE,
+            )
+        else:
+            steps = ApprovalStep.objects.none()
+
+        steps = (
+            steps.select_related("request", "request__requester", "assigned_reviewer", "decided_by")
+            .order_by("created_at")
+        )
+        serializer = ApprovalStepSerializer(steps, many=True)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+
+class ApprovalStepApproveAPIView(APIView):
+    permission_classes = [IsAuthenticated, IsReviewerOrAdmin]
+
+    def post(self, request, pk):
+        try:
+            step = ApprovalStep.objects.select_related("request", "assigned_reviewer").get(pk=pk)
+        except ApprovalStep.DoesNotExist:
+            return Response(
+                {"detail": "Approval step not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        if not step.is_active or step.status != ApprovalStep.Status.PENDING:
+            return Response(
+                {"detail": "This step is not currently awaiting decision."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        user = request.user
+        is_admin = user.is_superuser or (
+            hasattr(user, "profile") and user.profile.role == UserProfile.Role.ADMIN
+        )
+
+        if step.stage == ApprovalStep.Stage.MANAGER:
+            if step.assigned_reviewer != user and not is_admin:
+                return Response(
+                    {"detail": "You are not authorized to review this manager approval step."},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+        elif step.stage == ApprovalStep.Stage.FINANCE:
+            is_finance = hasattr(user, "profile") and user.profile.role == UserProfile.Role.FINANCE
+            if not is_finance and not is_admin:
+                return Response(
+                    {"detail": "Only Finance members can review this approval step."},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+
+        comments = request.data.get("comments", "").strip()
+
+        with transaction.atomic():
+            step.status = ApprovalStep.Status.APPROVED
+            step.decided_by = user
+            step.decided_at = timezone.now()
+            step.is_active = False
+            step.comments = comments
+            step.save()
+
+            next_step = ApprovalStep.objects.filter(
+                request=step.request,
+                sequence=step.sequence + 1,
+            ).first()
+
+            if next_step:
+                next_step.is_active = True
+                next_step.save()
+                message = f"Step {step.sequence} approved. Request advanced to step {next_step.sequence} ({next_step.stage})."
+            else:
+                step.request.status = PurchaseRequest.Status.APPROVED
+                step.request.save()
+                message = "All approval steps completed. Purchase request approved."
+
+        return Response(
+            {
+                "message": message,
+                "step": ApprovalStepSerializer(step).data,
+                "request_status": step.request.status,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class ApprovalStepRejectAPIView(APIView):
+    permission_classes = [IsAuthenticated, IsReviewerOrAdmin]
+
+    def post(self, request, pk):
+        try:
+            step = ApprovalStep.objects.select_related("request", "assigned_reviewer").get(pk=pk)
+        except ApprovalStep.DoesNotExist:
+            return Response(
+                {"detail": "Approval step not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        if not step.is_active or step.status != ApprovalStep.Status.PENDING:
+            return Response(
+                {"detail": "This step is not currently awaiting decision."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        user = request.user
+        is_admin = user.is_superuser or (
+            hasattr(user, "profile") and user.profile.role == UserProfile.Role.ADMIN
+        )
+
+        if step.stage == ApprovalStep.Stage.MANAGER:
+            if step.assigned_reviewer != user and not is_admin:
+                return Response(
+                    {"detail": "You are not authorized to review this manager approval step."},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+        elif step.stage == ApprovalStep.Stage.FINANCE:
+            is_finance = hasattr(user, "profile") and user.profile.role == UserProfile.Role.FINANCE
+            if not is_finance and not is_admin:
+                return Response(
+                    {"detail": "Only Finance members can review this approval step."},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+
+        comments = request.data.get("comments", "").strip()
+        if not comments:
+            return Response(
+                {"detail": "Rejection comments are required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        with transaction.atomic():
+            step.status = ApprovalStep.Status.REJECTED
+            step.decided_by = user
+            step.decided_at = timezone.now()
+            step.is_active = False
+            step.comments = comments
+            step.save()
+
+            ApprovalStep.objects.filter(
+                request=step.request,
+                sequence__gt=step.sequence,
+            ).update(
+                status=ApprovalStep.Status.SKIPPED,
+                is_active=False,
+            )
+
+            step.request.status = PurchaseRequest.Status.REJECTED
+            step.request.save()
+
+        return Response(
+            {
+                "message": "Purchase request rejected.",
+                "step": ApprovalStepSerializer(step).data,
+                "request_status": step.request.status,
             },
             status=status.HTTP_200_OK,
         )
