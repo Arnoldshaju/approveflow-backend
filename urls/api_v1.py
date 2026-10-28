@@ -12,9 +12,11 @@ from approvals.views import (
     ApprovalStepApproveAPIView,
     ApprovalStepRejectAPIView,
     CurrentUserAPIView,
+    DashboardStatsAPIView,
     HealthCheckAPIView,
     LoginAPIView,
     PendingApprovalsAPIView,
+    PurchaseRequestCancelAPIView,
     PurchaseRequestCreateAPIView,
     PurchaseRequestDetailAPIView,
     PurchaseRequestHistoryAPIView,
@@ -25,6 +27,7 @@ from approvals.views import (
 urlpatterns = [
     path("health/", HealthCheckAPIView.as_view(), name="health-check"),
     path("statuses/", StatusAPIView.as_view(), name="statuses"),
+    path("dashboard/stats/", DashboardStatsAPIView.as_view(), name="dashboard-stats"),
     path(
         "purchase-requests/",
         PurchaseRequestListCreateAPIView.as_view(),
@@ -39,6 +42,11 @@ urlpatterns = [
         "purchase-requests/<int:pk>/submit/",
         PurchaseRequestSubmitAPIView.as_view(),
         name="purchase-request-submit",
+    ),
+    path(
+        "purchase-requests/<int:pk>/cancel/",
+        PurchaseRequestCancelAPIView.as_view(),
+        name="purchase-request-cancel",
     ),
     path(
         "purchase-requests/<int:pk>/history/",

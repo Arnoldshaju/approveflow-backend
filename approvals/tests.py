@@ -1281,6 +1281,285 @@ class AuditLoggingAPITests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
 
+class RequestCancellationAPITests(APITestCase):
+    def setUp(self):
+        from decimal import Decimal
+        from approvals.models import ApprovalStep, AuditLog, PurchaseRequest, SystemSetting, UserProfile
+        from rest_framework_simplejwt.tokens import RefreshToken
+
+        self.Decimal = Decimal
+        self.PurchaseRequest = PurchaseRequest
+        self.ApprovalStep = ApprovalStep
+        self.AuditLog = AuditLog
+
+        # Manager
+        self.mgr = User.objects.create_user(
+            username="canc_mgr",
+            password="Password123!",
+            email="mgr@example.com",
+        )
+        self.mgr.profile.role = UserProfile.Role.MANAGER
+        self.mgr.profile.save()
+
+        # Employee
+        self.emp = User.objects.create_user(
+            username="canc_emp",
+            password="Password123!",
+            email="emp@example.com",
+        )
+        self.emp.profile.role = UserProfile.Role.EMPLOYEE
+        self.emp.profile.manager = self.mgr
+        self.emp.profile.save()
+        self.emp_token = str(RefreshToken.for_user(self.emp).access_token)
+
+        # Other employee
+        self.other_emp = User.objects.create_user(
+            username="canc_other",
+            password="Password123!",
+            email="other@example.com",
+        )
+        self.other_emp.profile.role = UserProfile.Role.EMPLOYEE
+        self.other_emp.profile.save()
+        self.other_token = str(RefreshToken.for_user(self.other_emp).access_token)
+
+        # Admin
+        self.admin = User.objects.create_user(
+            username="canc_admin",
+            password="Password123!",
+            email="admin@example.com",
+        )
+        self.admin.profile.role = UserProfile.Role.ADMIN
+        self.admin.profile.save()
+        self.admin_token = str(RefreshToken.for_user(self.admin).access_token)
+
+        SystemSetting.objects.update_or_create(
+            key="approval_threshold",
+            defaults={"value": Decimal("10000.00")},
+        )
+
+    def test_requester_can_cancel_pending_request(self):
+        """Requester can cancel a pending request, invalidating approval steps and logging audit event."""
+        pr = self.PurchaseRequest.objects.create(
+            requester=self.emp,
+            title="Desk Fan",
+            amount=self.Decimal("80.00"),
+            status=self.PurchaseRequest.Status.DRAFT,
+        )
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.emp_token}")
+        self.client.post(f"/api/v1/purchase-requests/{pr.id}/submit/")
+
+        # Cancel request
+        cancel_res = self.client.post(
+            f"/api/v1/purchase-requests/{pr.id}/cancel/",
+            {"reason": "Office temperature resolved."},
+        )
+        self.assertEqual(cancel_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(cancel_res.data["purchase_request"]["status"], "CANCELLED")
+
+        # Database checks
+        pr.refresh_from_db()
+        self.assertEqual(pr.status, self.PurchaseRequest.Status.CANCELLED)
+
+        # Steps must be skipped and inactive
+        for step in pr.steps.all():
+            self.assertFalse(step.is_active)
+            self.assertEqual(step.status, self.ApprovalStep.Status.SKIPPED)
+
+        # Audit log verified
+        last_log = pr.audit_logs.latest("timestamp")
+        self.assertEqual(last_log.action, self.AuditLog.Action.CANCELLED)
+        self.assertEqual(last_log.actor, self.emp)
+        self.assertIn("Office temperature resolved.", last_log.notes)
+
+    def test_cancel_already_approved_request_fails(self):
+        """Cannot cancel an approved request."""
+        pr = self.PurchaseRequest.objects.create(
+            requester=self.emp,
+            title="Approved Item",
+            amount=self.Decimal("200.00"),
+            status=self.PurchaseRequest.Status.APPROVED,
+        )
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.emp_token}")
+        response = self.client.post(f"/api/v1/purchase-requests/{pr.id}/cancel/")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_unauthorized_user_cannot_cancel(self):
+        """Another employee cannot cancel someone else's request."""
+        pr = self.PurchaseRequest.objects.create(
+            requester=self.emp,
+            title="Secret Project Expense",
+            amount=self.Decimal("500.00"),
+            status=self.PurchaseRequest.Status.PENDING,
+        )
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.other_token}")
+        response = self.client.post(f"/api/v1/purchase-requests/{pr.id}/cancel/")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+
+class QueryFilterPaginationAPITests(APITestCase):
+    def setUp(self):
+        from decimal import Decimal
+        from approvals.models import PurchaseRequest, UserProfile
+        from rest_framework_simplejwt.tokens import RefreshToken
+
+        self.Decimal = Decimal
+        self.PurchaseRequest = PurchaseRequest
+
+        self.user = User.objects.create_user(
+            username="query_user",
+            password="Password123!",
+            email="query@example.com",
+        )
+        self.user.profile.role = UserProfile.Role.EMPLOYEE
+        self.user.profile.save()
+        self.token = str(RefreshToken.for_user(self.user).access_token)
+
+        # Create diverse test requests
+        self.pr1 = self.PurchaseRequest.objects.create(
+            requester=self.user,
+            title="Apple MacBook Pro",
+            category="HARDWARE",
+            amount=self.Decimal("2500.00"),
+            status=self.PurchaseRequest.Status.APPROVED,
+            description="High performance laptop.",
+        )
+        self.pr2 = self.PurchaseRequest.objects.create(
+            requester=self.user,
+            title="IntelliJ IDEA License",
+            category="SOFTWARE",
+            amount=self.Decimal("250.00"),
+            status=self.PurchaseRequest.Status.PENDING,
+            description="IDE license for development.",
+        )
+        self.pr3 = self.PurchaseRequest.objects.create(
+            requester=self.user,
+            title="Office Desk & Chair",
+            category="OFFICE_SUPPLIES",
+            amount=self.Decimal("450.00"),
+            status=self.PurchaseRequest.Status.DRAFT,
+            description="Furniture.",
+        )
+
+    def test_filter_by_status(self):
+        """Can filter requests by status parameter."""
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.token}")
+        response = self.client.get("/api/v1/purchase-requests/?status=approved")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]["title"], "Apple MacBook Pro")
+
+    def test_filter_by_category(self):
+        """Can filter requests by category parameter."""
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.token}")
+        response = self.client.get("/api/v1/purchase-requests/?category=software")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]["title"], "IntelliJ IDEA License")
+
+    def test_filter_by_amount_range(self):
+        """Can filter requests by min_amount and max_amount."""
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.token}")
+        response = self.client.get("/api/v1/purchase-requests/?min_amount=300&max_amount=600")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]["title"], "Office Desk & Chair")
+
+    def test_search_keyword(self):
+        """Can search requests across title and description."""
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.token}")
+        response = self.client.get("/api/v1/purchase-requests/?search=macbook")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]["title"], "Apple MacBook Pro")
+
+    def test_pagination_structure(self):
+        """Querying with page parameter returns standard paginated format."""
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.token}")
+        response = self.client.get("/api/v1/purchase-requests/?page=1&page_size=2")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("count", response.data)
+        self.assertIn("next", response.data)
+        self.assertIn("results", response.data)
+        self.assertEqual(response.data["count"], 3)
+        self.assertEqual(len(response.data["results"]), 2)
+
+
+class DashboardStatsAPITests(APITestCase):
+    def setUp(self):
+        from decimal import Decimal
+        from approvals.models import ApprovalStep, PurchaseRequest, SystemSetting, UserProfile
+        from rest_framework_simplejwt.tokens import RefreshToken
+
+        self.Decimal = Decimal
+        self.PurchaseRequest = PurchaseRequest
+        self.ApprovalStep = ApprovalStep
+
+        # Manager
+        self.mgr = User.objects.create_user(
+            username="stats_mgr",
+            password="Password123!",
+            email="mgr@example.com",
+        )
+        self.mgr.profile.role = UserProfile.Role.MANAGER
+        self.mgr.profile.save()
+        self.mgr_token = str(RefreshToken.for_user(self.mgr).access_token)
+
+        # Employee
+        self.emp = User.objects.create_user(
+            username="stats_emp",
+            password="Password123!",
+            email="emp@example.com",
+        )
+        self.emp.profile.role = UserProfile.Role.EMPLOYEE
+        self.emp.profile.manager = self.mgr
+        self.emp.profile.save()
+        self.emp_token = str(RefreshToken.for_user(self.emp).access_token)
+
+        # Admin
+        self.admin = User.objects.create_user(
+            username="stats_admin",
+            password="Password123!",
+            email="admin@example.com",
+        )
+        self.admin.profile.role = UserProfile.Role.ADMIN
+        self.admin.profile.save()
+        self.admin_token = str(RefreshToken.for_user(self.admin).access_token)
+
+        # Create requests
+        self.PurchaseRequest.objects.create(
+            requester=self.emp,
+            title="Approved Laptop",
+            amount=self.Decimal("2000.00"),
+            status=self.PurchaseRequest.Status.APPROVED,
+        )
+        self.PurchaseRequest.objects.create(
+            requester=self.emp,
+            title="Draft Supplies",
+            amount=self.Decimal("150.00"),
+            status=self.PurchaseRequest.Status.DRAFT,
+        )
+
+    def test_employee_stats(self):
+        """Employee retrieves their own request metrics."""
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.emp_token}")
+        response = self.client.get("/api/v1/dashboard/stats/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["my_requests"]["total_requests"], 2)
+        self.assertEqual(response.data["my_requests"]["approved_count"], 1)
+        self.assertEqual(response.data["my_requests"]["draft_count"], 1)
+        self.assertEqual(response.data["my_requests"]["total_approved_amount"], "2000.00")
+        self.assertIsNone(response.data["organization_overview"])
+
+    def test_admin_stats_includes_organization_overview(self):
+        """Admin metrics include company-wide distribution."""
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.admin_token}")
+        response = self.client.get("/api/v1/dashboard/stats/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIsNotNone(response.data["organization_overview"])
+        self.assertEqual(response.data["organization_overview"]["organization_total_requests"], 2)
+
+
+
 
 
 

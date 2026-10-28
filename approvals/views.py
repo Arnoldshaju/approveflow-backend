@@ -1,8 +1,10 @@
 from decimal import Decimal
 from django.contrib.auth import get_user_model
 from django.db import transaction
+from django.db.models import Q, Sum
 from django.utils import timezone
 from rest_framework import status
+from rest_framework.pagination import PageNumberPagination
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -34,25 +36,72 @@ class HealthCheckAPIView(APIView):
         })
 
 
+class StandardResultsSetPagination(PageNumberPagination):
+    page_size = 10
+    page_size_query_param = "page_size"
+    max_page_size = 100
+
+
 class PurchaseRequestListCreateAPIView(APIView):
     def get(self, request):
         if request.user.is_superuser or (
             hasattr(request.user, "profile")
             and request.user.profile.role == UserProfile.Role.ADMIN
         ):
-            requests = (
+            queryset = (
                 PurchaseRequest.objects.all()
                 .select_related("requester")
-                .order_by("-created_at")
             )
         else:
-            requests = (
+            queryset = (
                 PurchaseRequest.objects.filter(requester=request.user)
                 .select_related("requester")
-                .order_by("-created_at")
             )
 
-        serializer = PurchaseRequestSerializer(requests, many=True)
+        # Filters
+        status_filter = request.query_params.get("status")
+        if status_filter:
+            queryset = queryset.filter(status=status_filter.upper())
+
+        category_filter = request.query_params.get("category")
+        if category_filter:
+            queryset = queryset.filter(category=category_filter.upper())
+
+        min_amount = request.query_params.get("min_amount")
+        if min_amount:
+            try:
+                queryset = queryset.filter(amount__gte=Decimal(min_amount))
+            except Exception:
+                pass
+
+        max_amount = request.query_params.get("max_amount")
+        if max_amount:
+            try:
+                queryset = queryset.filter(amount__lte=Decimal(max_amount))
+            except Exception:
+                pass
+
+        search = request.query_params.get("search")
+        if search:
+            queryset = queryset.filter(
+                Q(title__icontains=search) | Q(description__icontains=search)
+            )
+
+        ordering = request.query_params.get("ordering", "-created_at")
+        allowed_ordering = ["created_at", "-created_at", "amount", "-amount", "title", "-title"]
+        if ordering in allowed_ordering:
+            queryset = queryset.order_by(ordering)
+        else:
+            queryset = queryset.order_by("-created_at")
+
+        # Pagination: activate if 'page' or 'page_size' in query parameters
+        if "page" in request.query_params or "page_size" in request.query_params:
+            paginator = StandardResultsSetPagination()
+            page = paginator.paginate_queryset(queryset, request)
+            serializer = PurchaseRequestSerializer(page, many=True)
+            return paginator.get_paginated_response(serializer.data)
+
+        serializer = PurchaseRequestSerializer(queryset, many=True)
         return Response(serializer.data, status=status.HTTP_200_OK)
 
     def post(self, request):
@@ -494,6 +543,172 @@ class PurchaseRequestHistoryAPIView(APIView):
         logs = pr.audit_logs.select_related("actor").order_by("timestamp", "id")
         serializer = AuditLogSerializer(logs, many=True)
         return Response(serializer.data, status=status.HTTP_200_OK)
+
+
+class PurchaseRequestCancelAPIView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        try:
+            pr = PurchaseRequest.objects.select_related("requester").get(pk=pk)
+        except PurchaseRequest.DoesNotExist:
+            return Response(
+                {"detail": "Purchase request not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        user = request.user
+        is_admin = user.is_superuser or (
+            hasattr(user, "profile") and user.profile.role == UserProfile.Role.ADMIN
+        )
+        if pr.requester != user and not is_admin:
+            return Response(
+                {"detail": "You do not have permission to cancel this request."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        if pr.status in [PurchaseRequest.Status.APPROVED, PurchaseRequest.Status.REJECTED]:
+            return Response(
+                {"detail": "Cannot cancel a request that has already been approved or rejected."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if pr.status == PurchaseRequest.Status.CANCELLED:
+            return Response(
+                {"detail": "This purchase request is already cancelled."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        reason = request.data.get("reason", "").strip()
+        from_status = pr.status
+
+        with transaction.atomic():
+            pr.status = PurchaseRequest.Status.CANCELLED
+            pr.save()
+
+            pr.steps.filter(status=ApprovalStep.Status.PENDING).update(
+                status=ApprovalStep.Status.SKIPPED,
+                is_active=False,
+            )
+            pr.steps.filter(is_active=True).update(is_active=False)
+
+            notes = "Request cancelled by requester." if pr.requester == user else "Request cancelled by administrator."
+            if reason:
+                notes += f" Reason: {reason}"
+
+            AuditLog.log_action(
+                request=pr,
+                actor=user,
+                action=AuditLog.Action.CANCELLED,
+                from_status=from_status,
+                to_status=PurchaseRequest.Status.CANCELLED,
+                notes=notes,
+            )
+
+        serializer = PurchaseRequestSerializer(pr)
+        return Response(
+            {
+                "message": "Purchase request cancelled successfully.",
+                "purchase_request": serializer.data,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class DashboardStatsAPIView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        user = request.user
+        role = getattr(getattr(user, "profile", None), "role", UserProfile.Role.EMPLOYEE)
+        is_admin = user.is_superuser or role == UserProfile.Role.ADMIN
+
+        # My Requests statistics (for employee or personal view)
+        user_requests = PurchaseRequest.objects.filter(requester=user)
+        total_requests = user_requests.count()
+        total_approved_amount = (
+            user_requests.filter(status=PurchaseRequest.Status.APPROVED).aggregate(
+                total=Sum("amount")
+            )["total"]
+            or Decimal("0.00")
+        )
+
+        my_stats = {
+            "total_requests": total_requests,
+            "total_approved_amount": f"{Decimal(str(total_approved_amount)):.2f}",
+            "draft_count": user_requests.filter(status=PurchaseRequest.Status.DRAFT).count(),
+            "pending_count": user_requests.filter(status=PurchaseRequest.Status.PENDING).count(),
+            "approved_count": user_requests.filter(status=PurchaseRequest.Status.APPROVED).count(),
+            "rejected_count": user_requests.filter(status=PurchaseRequest.Status.REJECTED).count(),
+            "cancelled_count": user_requests.filter(status=PurchaseRequest.Status.CANCELLED).count(),
+        }
+
+        # Reviewer workload statistics
+        reviewer_stats = None
+        if role in [UserProfile.Role.MANAGER, UserProfile.Role.FINANCE, UserProfile.Role.ADMIN] or user.is_superuser:
+            if role == UserProfile.Role.MANAGER:
+                pending_reviews = ApprovalStep.objects.filter(
+                    stage=ApprovalStep.Stage.MANAGER,
+                    assigned_reviewer=user,
+                    is_active=True,
+                    status=ApprovalStep.Status.PENDING,
+                ).count()
+            elif role == UserProfile.Role.FINANCE:
+                pending_reviews = ApprovalStep.objects.filter(
+                    stage=ApprovalStep.Stage.FINANCE,
+                    is_active=True,
+                    status=ApprovalStep.Status.PENDING,
+                ).count()
+            else:
+                pending_reviews = ApprovalStep.objects.filter(
+                    is_active=True,
+                    status=ApprovalStep.Status.PENDING,
+                ).count()
+
+            decided_by_me = ApprovalStep.objects.filter(decided_by=user)
+            reviewer_stats = {
+                "pending_reviews_count": pending_reviews,
+                "approved_by_me_count": decided_by_me.filter(status=ApprovalStep.Status.APPROVED).count(),
+                "rejected_by_me_count": decided_by_me.filter(status=ApprovalStep.Status.REJECTED).count(),
+            }
+
+        # System-wide metrics (Admins only)
+        admin_stats = None
+        if is_admin:
+            all_requests = PurchaseRequest.objects.all()
+            org_approved_amount = (
+                all_requests.filter(status=PurchaseRequest.Status.APPROVED).aggregate(
+                    total=Sum("amount")
+                )["total"]
+                or Decimal("0.00")
+            )
+            admin_stats = {
+                "organization_total_requests": all_requests.count(),
+                "organization_total_approved_amount": f"{Decimal(str(org_approved_amount)):.2f}",
+                "active_threshold": f"{Decimal(str(SystemSetting.get_approval_threshold())):.2f}",
+                "status_distribution": {
+                    s: all_requests.filter(status=s).count()
+                    for s in PurchaseRequest.Status.values
+                },
+                "category_distribution": {
+                    c: all_requests.filter(category=c).count()
+                    for c in PurchaseRequest.Category.values
+                },
+            }
+
+        return Response(
+            {
+                "user": {
+                    "id": user.id,
+                    "username": user.get_username(),
+                    "role": role,
+                },
+                "my_requests": my_stats,
+                "reviewer_workload": reviewer_stats,
+                "organization_overview": admin_stats,
+            },
+            status=status.HTTP_200_OK,
+        )
 
 
 class LoginAPIView(APIView):
