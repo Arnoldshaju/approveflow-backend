@@ -1,6 +1,8 @@
 from decimal import Decimal
 from django.contrib.auth import get_user_model
+from django.core.cache import cache
 from django.db import transaction
+
 from django.db.models import Q, Sum
 from django.utils import timezone
 from rest_framework import status
@@ -31,6 +33,7 @@ User = get_user_model()
 
 
 class HealthCheckAPIView(APIView):
+    serializer_class = None
     permission_classes = [AllowAny]
 
     def get(self, request):
@@ -48,6 +51,8 @@ class StandardResultsSetPagination(PageNumberPagination):
 
 
 class PurchaseRequestListCreateAPIView(APIView):
+    serializer_class = PurchaseRequestSerializer
+
     def get(self, request):
         if request.user.is_superuser or (
             hasattr(request.user, "profile")
@@ -116,6 +121,7 @@ class PurchaseRequestListCreateAPIView(APIView):
         )
         if serializer.is_valid():
             pr = serializer.save()
+            invalidate_dashboard_cache()
             AuditLog.log_action(
                 request=pr,
                 actor=request.user,
@@ -138,6 +144,8 @@ PurchaseRequestCreateAPIView = PurchaseRequestListCreateAPIView
 
 
 class PurchaseRequestDetailAPIView(APIView):
+    serializer_class = PurchaseRequestSerializer
+
     def get_object(self, pk):
         try:
             return PurchaseRequest.objects.select_related("requester").get(pk=pk)
@@ -190,6 +198,7 @@ class PurchaseRequestDetailAPIView(APIView):
         )
         if serializer.is_valid():
             serializer.save()
+            invalidate_dashboard_cache()
             return Response(serializer.data, status=status.HTTP_200_OK)
 
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
@@ -219,6 +228,7 @@ class PurchaseRequestDetailAPIView(APIView):
             )
 
         pr.delete()
+        invalidate_dashboard_cache()
         return Response(
             {"detail": "Purchase request draft deleted successfully."},
             status=status.HTTP_204_NO_CONTENT,
@@ -226,6 +236,7 @@ class PurchaseRequestDetailAPIView(APIView):
 
 
 class PurchaseRequestSubmitAPIView(APIView):
+    serializer_class = PurchaseRequestSerializer
     permission_classes = [IsAuthenticated]
 
     def post(self, request, pk):
@@ -308,6 +319,7 @@ class PurchaseRequestSubmitAPIView(APIView):
             transaction.on_commit(
                 lambda: send_purchase_request_submitted_notification.delay(pr.id)
             )
+            invalidate_dashboard_cache()
 
 
         serializer = PurchaseRequestSerializer(pr)
@@ -321,6 +333,7 @@ class PurchaseRequestSubmitAPIView(APIView):
 
 
 class PendingApprovalsAPIView(APIView):
+    serializer_class = ApprovalStepSerializer
     permission_classes = [IsAuthenticated, IsReviewerOrAdmin]
 
     def get(self, request):
@@ -357,6 +370,7 @@ class PendingApprovalsAPIView(APIView):
 
 
 class ApprovalStepApproveAPIView(APIView):
+    serializer_class = ApprovalStepSerializer
     permission_classes = [IsAuthenticated, IsReviewerOrAdmin]
 
     def post(self, request, pk):
@@ -434,6 +448,7 @@ class ApprovalStepApproveAPIView(APIView):
             transaction.on_commit(
                 lambda: send_step_decision_notification.delay(step_id, "APPROVED", step_comments)
             )
+            invalidate_dashboard_cache()
 
 
         return Response(
@@ -447,6 +462,7 @@ class ApprovalStepApproveAPIView(APIView):
 
 
 class ApprovalStepRejectAPIView(APIView):
+    serializer_class = ApprovalStepSerializer
     permission_classes = [IsAuthenticated, IsReviewerOrAdmin]
 
     def post(self, request, pk):
@@ -524,6 +540,7 @@ class ApprovalStepRejectAPIView(APIView):
             transaction.on_commit(
                 lambda: send_step_decision_notification.delay(step_id, "REJECTED", step_comments)
             )
+            invalidate_dashboard_cache()
 
 
         return Response(
@@ -537,6 +554,7 @@ class ApprovalStepRejectAPIView(APIView):
 
 
 class PurchaseRequestHistoryAPIView(APIView):
+    serializer_class = AuditLogSerializer
     permission_classes = [IsAuthenticated]
 
     def get(self, request, pk):
@@ -570,6 +588,7 @@ class PurchaseRequestHistoryAPIView(APIView):
 
 
 class PurchaseRequestCancelAPIView(APIView):
+    serializer_class = PurchaseRequestSerializer
     permission_classes = [IsAuthenticated]
 
     def post(self, request, pk):
@@ -628,6 +647,7 @@ class PurchaseRequestCancelAPIView(APIView):
                 to_status=PurchaseRequest.Status.CANCELLED,
                 notes=notes,
             )
+            invalidate_dashboard_cache()
 
         serializer = PurchaseRequestSerializer(pr)
         return Response(
@@ -639,6 +659,25 @@ class PurchaseRequestCancelAPIView(APIView):
         )
 
 
+DASHBOARD_CACHE_TTL = 60  # seconds
+
+
+def get_dashboard_cache_version():
+    version = cache.get("dashboard_stats_version")
+    if version is None:
+        version = 1
+        cache.set("dashboard_stats_version", version, timeout=None)
+    return version
+
+
+def invalidate_dashboard_cache():
+    try:
+        cache.incr("dashboard_stats_version")
+    except Exception:
+        current = cache.get("dashboard_stats_version") or 1
+        cache.set("dashboard_stats_version", current + 1, timeout=None)
+
+
 class DashboardStatsAPIView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -646,6 +685,12 @@ class DashboardStatsAPIView(APIView):
         user = request.user
         role = getattr(getattr(user, "profile", None), "role", UserProfile.Role.EMPLOYEE)
         is_admin = user.is_superuser or role == UserProfile.Role.ADMIN
+
+        version = get_dashboard_cache_version()
+        cache_key = f"dashboard_stats_{user.id}_{role}_{is_admin}_v{version}"
+        cached_stats = cache.get(cache_key)
+        if cached_stats is not None:
+            return Response(cached_stats, status=status.HTTP_200_OK)
 
         # My Requests statistics (for employee or personal view)
         user_requests = PurchaseRequest.objects.filter(requester=user)
@@ -720,22 +765,23 @@ class DashboardStatsAPIView(APIView):
                 },
             }
 
-        return Response(
-            {
-                "user": {
-                    "id": user.id,
-                    "username": user.get_username(),
-                    "role": role,
-                },
-                "my_requests": my_stats,
-                "reviewer_workload": reviewer_stats,
-                "organization_overview": admin_stats,
+        response_data = {
+            "user": {
+                "id": user.id,
+                "username": user.get_username(),
+                "role": role,
             },
-            status=status.HTTP_200_OK,
-        )
+            "my_requests": my_stats,
+            "reviewer_workload": reviewer_stats,
+            "organization_overview": admin_stats,
+        }
+        cache.set(cache_key, response_data, timeout=DASHBOARD_CACHE_TTL)
+        return Response(response_data, status=status.HTTP_200_OK)
+
 
 
 class LoginAPIView(APIView):
+    serializer_class = LoginSerializer
     permission_classes = [AllowAny]
 
     def post(self, request):
@@ -765,6 +811,7 @@ class LoginAPIView(APIView):
 
 
 class CurrentUserAPIView(APIView):
+    serializer_class = AdminUserSerializer
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
@@ -777,6 +824,7 @@ class CurrentUserAPIView(APIView):
 
 
 class AdminUserListCreateAPIView(APIView):
+    serializer_class = AdminUserSerializer
     permission_classes = [IsAdmin]
 
     def get(self, request):
@@ -800,6 +848,7 @@ class AdminUserListCreateAPIView(APIView):
 
 
 class AdminUserDetailAPIView(APIView):
+    serializer_class = AdminUserSerializer
     permission_classes = [IsAdmin]
 
     def get_object(self, pk):
@@ -853,7 +902,9 @@ class AdminUserDetailAPIView(APIView):
 
 
 class AdminThresholdAPIView(APIView):
+    serializer_class = ThresholdSettingSerializer
     permission_classes = [IsAdmin]
+
 
     def get_object(self):
         setting, _ = SystemSetting.objects.get_or_create(
@@ -876,6 +927,7 @@ class AdminThresholdAPIView(APIView):
         )
         if serializer.is_valid():
             serializer.save()
+            invalidate_dashboard_cache()
             return Response(serializer.data, status=status.HTTP_200_OK)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 

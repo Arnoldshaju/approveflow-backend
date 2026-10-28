@@ -173,3 +173,20 @@ CELERY_BEAT_SCHEDULE = {
         'kwargs': {'hours_threshold': 24},
     },
 }
+
+# OpenAPI & Swagger Documentation (drf-spectacular)
+SPECTACULAR_SETTINGS = {
+    'TITLE': 'ApproveFlow API',
+    'DESCRIPTION': (
+        'ApproveFlow is a backend RESTful API platform for enterprise purchase request management, '
+        'multi-tier sequential approvals, configurable financial thresholds, and immutable audit logging.'
+    ),
+    'VERSION': '1.0.0',
+    'SERVE_INCLUDE_SCHEMA': False,
+    'COMPONENT_SPLIT_REQUEST': True,
+    'SWAGGER_UI_SETTINGS': {
+        'deepLinking': True,
+        'persistAuthorization': True,
+        'displayOperationId': True,
+    },
+}

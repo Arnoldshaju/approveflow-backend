@@ -6,6 +6,7 @@ from rest_framework.views import APIView
 
 
 class StatusAPIView(APIView):
+    serializer_class = None
     permission_classes = [AllowAny]
 
     def get(self, request):

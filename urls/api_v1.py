@@ -1,8 +1,14 @@
 from django.urls import path
+from drf_spectacular.views import (
+    SpectacularAPIView,
+    SpectacularRedocView,
+    SpectacularSwaggerView,
+)
 from rest_framework_simplejwt.views import (
     TokenObtainPairView,
     TokenRefreshView,
 )
+
 
 from api_v1.statuses.views import StatusAPIView
 from approvals.views import (
@@ -66,4 +72,9 @@ urlpatterns = [
     path("admin/users/<int:pk>/", AdminUserDetailAPIView.as_view(), name="admin-user-detail"),
     # Admin System Threshold Configuration
     path("admin/threshold/", AdminThresholdAPIView.as_view(), name="admin-threshold"),
+    # Interactive OpenAPI 3 & Swagger Documentation
+    path("schema/", SpectacularAPIView.as_view(), name="schema"),
+    path("docs/", SpectacularSwaggerView.as_view(url_name="schema"), name="swagger-ui"),
+    path("redoc/", SpectacularRedocView.as_view(url_name="schema"), name="redoc"),
 ]
+

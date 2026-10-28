@@ -1754,6 +1754,83 @@ class CeleryAsynchronousNotificationTests(APITestCase):
         self.assertGreaterEqual(len(mail.outbox), 1)
 
 
+from django.core.cache import cache
+from approvals.views import get_dashboard_cache_version
+
+
+class RedisDashboardCachingTests(APITestCase):
+    def setUp(self):
+        cache.clear()
+        self.user = User.objects.create_user(
+            username="cache_user",
+            password="Password123!",
+            email="cache_user@company.local",
+        )
+        self.user.profile.role = UserProfile.Role.EMPLOYEE
+        self.user.profile.save()
+        self.token = str(RefreshToken.for_user(self.user).access_token)
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.token}")
+
+    def test_dashboard_stats_cached_and_served(self):
+        """First request computes stats, subsequent request served from cache."""
+        res1 = self.client.get("/api/v1/dashboard/stats/")
+        self.assertEqual(res1.status_code, status.HTTP_200_OK)
+        self.assertEqual(res1.data["my_requests"]["total_requests"], 0)
+
+        # Create a request directly in database behind the scenes (without view hooks)
+        PurchaseRequest.objects.create(
+            requester=self.user,
+            title="Sneaky Request",
+            amount=Decimal("100.00"),
+            status=PurchaseRequest.Status.DRAFT,
+        )
+
+        # Second request should return cached 0 total_requests
+        res2 = self.client.get("/api/v1/dashboard/stats/")
+        self.assertEqual(res2.status_code, status.HTTP_200_OK)
+        self.assertEqual(res2.data["my_requests"]["total_requests"], 0)
+
+    def test_dashboard_cache_invalidated_on_api_creation(self):
+        """Creating request via API invalidates cache so fresh data is returned."""
+        self.client.get("/api/v1/dashboard/stats/")
+
+        # Post via API
+        create_res = self.client.post(
+            "/api/v1/purchase-requests/",
+            {"title": "Monitors", "amount": "400.00", "category": "HARDWARE"},
+            format="json",
+        )
+        self.assertEqual(create_res.status_code, status.HTTP_201_CREATED)
+
+        # Next request must reflect new count 1
+        res = self.client.get("/api/v1/dashboard/stats/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(res.data["my_requests"]["total_requests"], 1)
+
+
+class OpenAPIDocumentationTests(APITestCase):
+    def test_openapi_schema_endpoint(self):
+        """GET /api/v1/schema/ returns OpenAPI 3.0 YAML schema."""
+        response = self.client.get("/api/v1/schema/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("openapi: 3.0", response.content.decode("utf-8"))
+
+    def test_swagger_ui_endpoint(self):
+        """GET /api/v1/docs/ serves Swagger UI HTML interface."""
+        response = self.client.get("/api/v1/docs/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("text/html", response.headers["Content-Type"])
+        self.assertIn("swagger-ui", response.content.decode("utf-8"))
+
+    def test_redoc_endpoint(self):
+        """GET /api/v1/redoc/ serves ReDoc documentation HTML interface."""
+        response = self.client.get("/api/v1/redoc/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("text/html", response.headers["Content-Type"])
+        self.assertIn("redoc", response.content.decode("utf-8"))
+
+
+
 
 
 

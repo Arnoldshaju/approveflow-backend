@@ -90,8 +90,12 @@ All endpoints are versioned under `/api/v1/`:
 | `GET`, `POST` | `/api/v1/admin/users/` | List and create user accounts | Admin |
 | `GET`, `PUT`, `DELETE` | `/api/v1/admin/users/<id>/` | Manage specific user & role | Admin |
 | `GET`, `PUT` | `/api/v1/admin/threshold/` | View or update approval threshold | Admin |
+| `GET` | `/api/v1/docs/` | Interactive Swagger UI Documentation | Public |
+| `GET` | `/api/v1/redoc/` | ReDoc Interactive Documentation | Public |
+| `GET` | `/api/v1/schema/` | Raw OpenAPI 3.0 YAML Schema | Public |
 
 ---
+
 
 ## 🧪 Testing
 
