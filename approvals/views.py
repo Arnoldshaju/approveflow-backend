@@ -8,11 +8,12 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
 
-from approvals.models import ApprovalStep, PurchaseRequest, SystemSetting, UserProfile
+from approvals.models import ApprovalStep, AuditLog, PurchaseRequest, SystemSetting, UserProfile
 from approvals.permissions import IsAdmin, IsReviewerOrAdmin
 from .serializers import (
     AdminUserSerializer,
     ApprovalStepSerializer,
+    AuditLogSerializer,
     LoginSerializer,
     PurchaseRequestSerializer,
     ThresholdSettingSerializer,
@@ -60,7 +61,15 @@ class PurchaseRequestListCreateAPIView(APIView):
             context={"request": request},
         )
         if serializer.is_valid():
-            serializer.save()
+            pr = serializer.save()
+            AuditLog.log_action(
+                request=pr,
+                actor=request.user,
+                action=AuditLog.Action.CREATED,
+                from_status="",
+                to_status=pr.status,
+                notes="Draft purchase request created.",
+            )
             return Response(
                 serializer.data,
                 status=status.HTTP_201_CREATED,
@@ -232,6 +241,16 @@ class PurchaseRequestSubmitAPIView(APIView):
                     is_active=False,
                 )
 
+            # Record audit entry for submission
+            AuditLog.log_action(
+                request=pr,
+                actor=request.user,
+                action=AuditLog.Action.SUBMITTED,
+                from_status=PurchaseRequest.Status.DRAFT,
+                to_status=PurchaseRequest.Status.PENDING,
+                notes=f"Submitted for approval with snapshot threshold ₹{active_threshold}.",
+            )
+
         serializer = PurchaseRequestSerializer(pr)
         return Response(
             {
@@ -339,6 +358,18 @@ class ApprovalStepApproveAPIView(APIView):
                 step.request.save()
                 message = "All approval steps completed. Purchase request approved."
 
+            notes = f"Step {step.sequence} ({step.stage}) approved."
+            if comments:
+                notes += f" Comments: {comments}"
+            AuditLog.log_action(
+                request=step.request,
+                actor=user,
+                action=AuditLog.Action.STEP_APPROVED,
+                from_status=PurchaseRequest.Status.PENDING,
+                to_status=step.request.status,
+                notes=notes,
+            )
+
         return Response(
             {
                 "message": message,
@@ -412,6 +443,16 @@ class ApprovalStepRejectAPIView(APIView):
             step.request.status = PurchaseRequest.Status.REJECTED
             step.request.save()
 
+            notes = f"Step {step.sequence} ({step.stage}) rejected. Reason: {comments}"
+            AuditLog.log_action(
+                request=step.request,
+                actor=user,
+                action=AuditLog.Action.REJECTED,
+                from_status=PurchaseRequest.Status.PENDING,
+                to_status=PurchaseRequest.Status.REJECTED,
+                notes=notes,
+            )
+
         return Response(
             {
                 "message": "Purchase request rejected.",
@@ -420,6 +461,39 @@ class ApprovalStepRejectAPIView(APIView):
             },
             status=status.HTTP_200_OK,
         )
+
+
+class PurchaseRequestHistoryAPIView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        try:
+            pr = PurchaseRequest.objects.select_related("requester").get(pk=pk)
+        except PurchaseRequest.DoesNotExist:
+            return Response(
+                {"detail": "Purchase request not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        user = request.user
+        is_owner = pr.requester == user
+        is_admin = user.is_superuser or (
+            hasattr(user, "profile") and user.profile.role == UserProfile.Role.ADMIN
+        )
+        is_reviewer = hasattr(user, "profile") and user.profile.role in [
+            UserProfile.Role.MANAGER,
+            UserProfile.Role.FINANCE,
+        ]
+
+        if not (is_owner or is_admin or is_reviewer):
+            return Response(
+                {"detail": "You do not have permission to view the audit history for this request."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        logs = pr.audit_logs.select_related("actor").order_by("timestamp", "id")
+        serializer = AuditLogSerializer(logs, many=True)
+        return Response(serializer.data, status=status.HTTP_200_OK)
 
 
 class LoginAPIView(APIView):

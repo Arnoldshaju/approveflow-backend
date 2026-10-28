@@ -2,7 +2,7 @@ from decimal import Decimal
 from django.contrib.auth import authenticate, get_user_model
 from rest_framework import serializers
 
-from .models import ApprovalStep, PurchaseRequest, SystemSetting, UserProfile
+from .models import ApprovalStep, AuditLog, PurchaseRequest, SystemSetting, UserProfile
 
 User = get_user_model()
 
@@ -284,4 +284,31 @@ class ThresholdSettingSerializer(serializers.Serializer):
             instance.updated_by = request.user
         instance.save()
         return instance
+
+
+class AuditLogSerializer(serializers.ModelSerializer):
+    actor = serializers.SerializerMethodField()
+
+    class Meta:
+        model = AuditLog
+        fields = [
+            "id",
+            "request_id",
+            "actor",
+            "action",
+            "from_status",
+            "to_status",
+            "notes",
+            "timestamp",
+        ]
+        read_only_fields = fields
+
+    def get_actor(self, obj):
+        if obj.actor:
+            return {
+                "id": obj.actor.id,
+                "username": obj.actor.get_username(),
+            }
+        return None
+
 

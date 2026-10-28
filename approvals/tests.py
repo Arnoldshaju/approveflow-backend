@@ -1110,6 +1110,178 @@ class ApprovalDecisionAPITests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
 
+class AuditLoggingAPITests(APITestCase):
+    def setUp(self):
+        from decimal import Decimal
+        from approvals.models import ApprovalStep, AuditLog, PurchaseRequest, SystemSetting, UserProfile
+        from rest_framework_simplejwt.tokens import RefreshToken
+
+        self.Decimal = Decimal
+        self.PurchaseRequest = PurchaseRequest
+        self.ApprovalStep = ApprovalStep
+        self.AuditLog = AuditLog
+        self.SystemSetting = SystemSetting
+
+        # Manager
+        self.manager = User.objects.create_user(
+            username="audit_manager",
+            password="Password123!",
+            email="mgr@example.com",
+        )
+        self.manager.profile.role = UserProfile.Role.MANAGER
+        self.manager.profile.save()
+        self.manager_token = str(RefreshToken.for_user(self.manager).access_token)
+
+        # Employee assigned to manager
+        self.employee = User.objects.create_user(
+            username="audit_employee",
+            password="Password123!",
+            email="emp@example.com",
+        )
+        self.employee.profile.role = UserProfile.Role.EMPLOYEE
+        self.employee.profile.manager = self.manager
+        self.employee.profile.save()
+        self.emp_token = str(RefreshToken.for_user(self.employee).access_token)
+
+        # Unrelated employee
+        self.other_emp = User.objects.create_user(
+            username="other_employee",
+            password="Password123!",
+            email="other@example.com",
+        )
+        self.other_emp.profile.role = UserProfile.Role.EMPLOYEE
+        self.other_emp.profile.save()
+        self.other_token = str(RefreshToken.for_user(self.other_emp).access_token)
+
+        # Admin
+        self.admin = User.objects.create_user(
+            username="audit_admin",
+            password="Password123!",
+            email="admin@example.com",
+        )
+        self.admin.profile.role = UserProfile.Role.ADMIN
+        self.admin.profile.save()
+        self.admin_token = str(RefreshToken.for_user(self.admin).access_token)
+
+        # Ensure default threshold
+        SystemSetting.objects.update_or_create(
+            key="approval_threshold",
+            defaults={"value": Decimal("10000.00")},
+        )
+
+    def test_lifecycle_audit_trail_generation(self):
+        """Audit logs are recorded across CREATED, SUBMITTED, and STEP_APPROVED."""
+        # 1. Create Draft Request
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.emp_token}")
+        create_res = self.client.post(
+            "/api/v1/purchase-requests/",
+            {
+                "title": "Ergonomic Chair",
+                "category": "OFFICE_SUPPLIES",
+                "amount": "450.00",
+                "description": "Ergonomic office setup.",
+            },
+        )
+        self.assertEqual(create_res.status_code, status.HTTP_201_CREATED)
+        pr_id = create_res.data["id"]
+
+        pr = self.PurchaseRequest.objects.get(id=pr_id)
+        logs = pr.audit_logs.all().order_by("timestamp", "id")
+        self.assertEqual(logs.count(), 1)
+        self.assertEqual(logs[0].action, self.AuditLog.Action.CREATED)
+        self.assertEqual(logs[0].actor, self.employee)
+        self.assertEqual(logs[0].to_status, self.PurchaseRequest.Status.DRAFT)
+
+        # 2. Submit Request
+        submit_res = self.client.post(f"/api/v1/purchase-requests/{pr_id}/submit/")
+        self.assertEqual(submit_res.status_code, status.HTTP_200_OK)
+
+        logs = pr.audit_logs.all().order_by("timestamp", "id")
+        self.assertEqual(logs.count(), 2)
+        self.assertEqual(logs[1].action, self.AuditLog.Action.SUBMITTED)
+        self.assertEqual(logs[1].actor, self.employee)
+        self.assertEqual(logs[1].from_status, self.PurchaseRequest.Status.DRAFT)
+        self.assertEqual(logs[1].to_status, self.PurchaseRequest.Status.PENDING)
+
+        # 3. Manager Approves Step 1
+        step1 = pr.steps.get(sequence=1)
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.manager_token}")
+        approve_res = self.client.post(
+            f"/api/v1/approvals/steps/{step1.id}/approve/",
+            {"comments": "Approved on budget."},
+        )
+        self.assertEqual(approve_res.status_code, status.HTTP_200_OK)
+
+        logs = pr.audit_logs.all().order_by("timestamp", "id")
+        self.assertEqual(logs.count(), 3)
+        self.assertEqual(logs[2].action, self.AuditLog.Action.STEP_APPROVED)
+        self.assertEqual(logs[2].actor, self.manager)
+        self.assertEqual(logs[2].to_status, self.PurchaseRequest.Status.APPROVED)
+        self.assertIn("Approved on budget", logs[2].notes)
+
+    def test_rejection_audit_log_captures_mandatory_reason(self):
+        """Rejecting records a REJECTED audit log containing the mandatory rejection reason."""
+        pr = self.PurchaseRequest.objects.create(
+            requester=self.employee,
+            title="Standing Desk",
+            amount=self.Decimal("800.00"),
+            status=self.PurchaseRequest.Status.DRAFT,
+        )
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.emp_token}")
+        self.client.post(f"/api/v1/purchase-requests/{pr.id}/submit/")
+
+        step1 = pr.steps.get(sequence=1)
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.manager_token}")
+        reject_res = self.client.post(
+            f"/api/v1/approvals/steps/{step1.id}/reject/",
+            {"comments": "Desk expense not permitted this quarter."},
+        )
+        self.assertEqual(reject_res.status_code, status.HTTP_200_OK)
+
+        last_log = pr.audit_logs.latest("timestamp")
+        self.assertEqual(last_log.action, self.AuditLog.Action.REJECTED)
+        self.assertEqual(last_log.actor, self.manager)
+        self.assertEqual(last_log.to_status, self.PurchaseRequest.Status.REJECTED)
+        self.assertIn("Desk expense not permitted this quarter", last_log.notes)
+
+    def test_requester_and_admin_can_retrieve_history(self):
+        """Requester and Admin can fetch the chronological audit history."""
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.emp_token}")
+        create_res = self.client.post(
+            "/api/v1/purchase-requests/",
+            {"title": "Keyboard", "amount": "120.00"},
+        )
+        pr_id = create_res.data["id"]
+        self.client.post(f"/api/v1/purchase-requests/{pr_id}/submit/")
+
+        # Requester retrieves history
+        res_emp = self.client.get(f"/api/v1/purchase-requests/{pr_id}/history/")
+        self.assertEqual(res_emp.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(res_emp.data), 2)
+        self.assertEqual(res_emp.data[0]["action"], "CREATED")
+        self.assertEqual(res_emp.data[1]["action"], "SUBMITTED")
+
+        # Admin retrieves history
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.admin_token}")
+        res_admin = self.client.get(f"/api/v1/purchase-requests/{pr_id}/history/")
+        self.assertEqual(res_admin.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(res_admin.data), 2)
+
+    def test_unrelated_employee_forbidden_from_history(self):
+        """Unrelated employees cannot view audit history for requests they do not own."""
+        pr = self.PurchaseRequest.objects.create(
+            requester=self.employee,
+            title="Private Request",
+            amount=self.Decimal("500.00"),
+            status=self.PurchaseRequest.Status.DRAFT,
+        )
+
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.other_token}")
+        response = self.client.get(f"/api/v1/purchase-requests/{pr.id}/history/")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+
+
 
 
 

@@ -17,6 +17,7 @@ from approvals.views import (
     PendingApprovalsAPIView,
     PurchaseRequestCreateAPIView,
     PurchaseRequestDetailAPIView,
+    PurchaseRequestHistoryAPIView,
     PurchaseRequestListCreateAPIView,
     PurchaseRequestSubmitAPIView,
 )
@@ -38,6 +39,11 @@ urlpatterns = [
         "purchase-requests/<int:pk>/submit/",
         PurchaseRequestSubmitAPIView.as_view(),
         name="purchase-request-submit",
+    ),
+    path(
+        "purchase-requests/<int:pk>/history/",
+        PurchaseRequestHistoryAPIView.as_view(),
+        name="purchase-request-history",
     ),
     # Approvals Workflow Decision APIs
     path("approvals/pending/", PendingApprovalsAPIView.as_view(), name="pending-approvals"),

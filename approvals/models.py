@@ -186,6 +186,61 @@ class ApprovalStep(models.Model):
         return f"Request #{self.request_id} - Step {self.sequence} ({self.stage}): {self.status}"
 
 
+class AuditLog(models.Model):
+    class Action(models.TextChoices):
+        CREATED = "CREATED", "Created"
+        SUBMITTED = "SUBMITTED", "Submitted"
+        STEP_APPROVED = "STEP_APPROVED", "Step Approved"
+        REJECTED = "REJECTED", "Rejected"
+        CANCELLED = "CANCELLED", "Cancelled"
+
+    request = models.ForeignKey(
+        PurchaseRequest,
+        on_delete=models.CASCADE,
+        related_name="audit_logs",
+    )
+    actor = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="audit_logs",
+    )
+    action = models.CharField(
+        max_length=50,
+        choices=Action.choices,
+    )
+    from_status = models.CharField(
+        max_length=30,
+        blank=True,
+        default="",
+    )
+    to_status = models.CharField(
+        max_length=30,
+        blank=True,
+        default="",
+    )
+    notes = models.TextField(blank=True, default="")
+    timestamp = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["timestamp", "id"]
+
+    def __str__(self):
+        return f"AuditLog #{self.id} - Request #{self.request_id} [{self.action}] by {self.actor}"
+
+    @classmethod
+    def log_action(cls, request, actor, action, from_status="", to_status="", notes=""):
+        return cls.objects.create(
+            request=request,
+            actor=actor,
+            action=action,
+            from_status=from_status,
+            to_status=to_status,
+            notes=notes,
+        )
+
+
 @receiver(post_save, sender=settings.AUTH_USER_MODEL)
 def create_or_update_user_profile(sender, instance, created, **kwargs):
     if created:
