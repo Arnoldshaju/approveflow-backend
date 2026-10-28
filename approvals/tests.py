@@ -1559,6 +1559,202 @@ class DashboardStatsAPITests(APITestCase):
         self.assertEqual(response.data["organization_overview"]["organization_total_requests"], 2)
 
 
+from datetime import timedelta
+from decimal import Decimal
+from django.core import mail
+from django.test import override_settings
+from django.utils import timezone
+from rest_framework_simplejwt.tokens import RefreshToken
+
+from approvals.models import ApprovalStep, PurchaseRequest, UserProfile
+from approvals.tasks import (
+    check_pending_approval_sla_reminders,
+    send_purchase_request_submitted_notification,
+    send_step_decision_notification,
+)
+
+
+
+@override_settings(CELERY_TASK_ALWAYS_EAGER=True, CELERY_TASK_EAGER_PROPAGATES=True)
+class CeleryAsynchronousNotificationTests(APITestCase):
+    def setUp(self):
+        mail.outbox.clear()
+
+        # Manager user
+        self.manager = User.objects.create_user(
+            username="celery_manager",
+            password="Password123!",
+            email="manager@company.local",
+        )
+        self.manager.profile.role = UserProfile.Role.MANAGER
+        self.manager.profile.save()
+
+        # Employee user mapped to manager
+        self.employee = User.objects.create_user(
+            username="celery_employee",
+            password="Password123!",
+            email="employee@company.local",
+        )
+        self.employee.profile.role = UserProfile.Role.EMPLOYEE
+        self.employee.profile.manager = self.manager
+        self.employee.profile.save()
+        self.employee_token = str(RefreshToken.for_user(self.employee).access_token)
+        self.manager_token = str(RefreshToken.for_user(self.manager).access_token)
+
+        # Finance user
+        self.finance = User.objects.create_user(
+            username="celery_finance",
+            password="Password123!",
+            email="finance@company.local",
+        )
+        self.finance.profile.role = UserProfile.Role.FINANCE
+        self.finance.profile.save()
+
+        # Purchase Request
+        self.pr = PurchaseRequest.objects.create(
+            requester=self.employee,
+            title="MacBook Pro M3",
+            description="Workstation laptop upgrade",
+            amount=Decimal("15000.00"),
+            category=PurchaseRequest.Category.HARDWARE,
+            status=PurchaseRequest.Status.PENDING,
+            applied_threshold=Decimal("10000.00"),
+            submitted_at=timezone.now(),
+        )
+
+        # Step 1: Manager Review (active)
+        self.step_manager = ApprovalStep.objects.create(
+            request=self.pr,
+            stage=ApprovalStep.Stage.MANAGER,
+            sequence=1,
+            assigned_reviewer=self.manager,
+            status=ApprovalStep.Status.PENDING,
+            is_active=True,
+        )
+
+        # Step 2: Finance Review (inactive until manager approves)
+        self.step_finance = ApprovalStep.objects.create(
+            request=self.pr,
+            stage=ApprovalStep.Stage.FINANCE,
+            sequence=2,
+            assigned_reviewer=None,
+            status=ApprovalStep.Status.PENDING,
+            is_active=False,
+        )
+
+    def test_submission_notification_task_sends_email_to_manager(self):
+        """send_purchase_request_submitted_notification emails the assigned manager."""
+        result = send_purchase_request_submitted_notification(self.pr.id)
+        self.assertEqual(result["status"], "sent")
+        self.assertEqual(len(mail.outbox), 1)
+        email = mail.outbox[0]
+        self.assertIn("celery_manager", email.body)
+        self.assertIn(self.pr.title, email.subject)
+        self.assertIn("manager@company.local", email.to)
+
+    def test_step_approved_advancing_to_finance_notifies_requester_and_finance(self):
+        """When manager approves a high-value request, finance and requester are notified."""
+        self.step_manager.status = ApprovalStep.Status.APPROVED
+        self.step_manager.is_active = False
+        self.step_manager.save()
+        self.step_finance.is_active = True
+        self.step_finance.save()
+
+        result = send_step_decision_notification(
+            self.step_manager.id, "APPROVED", comments="Approved by manager"
+        )
+        self.assertEqual(result["status"], "sent")
+        self.assertEqual(len(mail.outbox), 2)
+        recipients = [m.to[0] for m in mail.outbox]
+        self.assertIn("employee@company.local", recipients)
+        self.assertIn("finance@company.local", recipients)
+
+    def test_step_final_approved_notifies_requester(self):
+        """When final step approves, requester receives confirmation email."""
+        single_pr = PurchaseRequest.objects.create(
+            requester=self.employee,
+            title="Desk Monitor",
+            amount=Decimal("300.00"),
+            status=PurchaseRequest.Status.APPROVED,
+            submitted_at=timezone.now(),
+        )
+        final_step = ApprovalStep.objects.create(
+            request=single_pr,
+            stage=ApprovalStep.Stage.MANAGER,
+            sequence=1,
+            assigned_reviewer=self.manager,
+            status=ApprovalStep.Status.APPROVED,
+            is_active=False,
+        )
+
+        result = send_step_decision_notification(
+            final_step.id, "APPROVED", comments="Looks good"
+        )
+        self.assertEqual(result["status"], "sent")
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertIn("employee@company.local", mail.outbox[0].to)
+        self.assertIn("Fully Approved", mail.outbox[0].subject)
+
+    def test_step_rejected_notifies_requester_with_reason(self):
+        """When a step is rejected, requester receives notification with the rejection reason."""
+        self.step_manager.status = ApprovalStep.Status.REJECTED
+        self.step_manager.is_active = False
+        self.step_manager.save()
+        self.pr.status = PurchaseRequest.Status.REJECTED
+        self.pr.save()
+
+        result = send_step_decision_notification(
+            self.step_manager.id, "REJECTED", comments="Budget exhausted for this quarter."
+        )
+        self.assertEqual(result["status"], "sent")
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertIn("employee@company.local", mail.outbox[0].to)
+        self.assertIn("Rejected", mail.outbox[0].subject)
+        self.assertIn("Budget exhausted for this quarter.", mail.outbox[0].body)
+
+    def test_check_pending_approval_sla_reminders(self):
+        """Periodic SLA check emails reviewers for requests pending longer than threshold."""
+        # Make pr submitted 30 hours ago
+        self.pr.submitted_at = timezone.now() - timedelta(hours=30)
+        self.pr.save()
+
+        result = check_pending_approval_sla_reminders(hours_threshold=24)
+        self.assertGreaterEqual(result["reminders_sent"], 1)
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertIn("manager@company.local", mail.outbox[0].to)
+        self.assertIn("[Reminder]", mail.outbox[0].subject)
+
+    def test_api_submit_triggers_asynchronous_email(self):
+        """Submitting a draft request through API dispatches notification email via on_commit."""
+        draft = PurchaseRequest.objects.create(
+            requester=self.employee,
+            title="Office Chair",
+            amount=Decimal("250.00"),
+            status=PurchaseRequest.Status.DRAFT,
+        )
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.employee_token}")
+        with self.captureOnCommitCallbacks(execute=True):
+            response = self.client.post(f"/api/v1/purchase-requests/{draft.id}/submit/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertIn("manager@company.local", mail.outbox[0].to)
+
+    def test_api_decision_triggers_asynchronous_email(self):
+        """Approving a step through API dispatches decision email via on_commit."""
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.manager_token}")
+        with self.captureOnCommitCallbacks(execute=True):
+            response = self.client.post(
+                f"/api/v1/approvals/steps/{self.step_manager.id}/approve/",
+                {"comments": "Approved via API"},
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertGreaterEqual(len(mail.outbox), 1)
+
+
+
 
 
 

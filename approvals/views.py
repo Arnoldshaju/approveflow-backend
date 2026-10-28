@@ -12,7 +12,12 @@ from rest_framework_simplejwt.tokens import RefreshToken
 
 from approvals.models import ApprovalStep, AuditLog, PurchaseRequest, SystemSetting, UserProfile
 from approvals.permissions import IsAdmin, IsReviewerOrAdmin
+from approvals.tasks import (
+    send_purchase_request_submitted_notification,
+    send_step_decision_notification,
+)
 from .serializers import (
+
     AdminUserSerializer,
     ApprovalStepSerializer,
     AuditLogSerializer,
@@ -300,6 +305,11 @@ class PurchaseRequestSubmitAPIView(APIView):
                 notes=f"Submitted for approval with snapshot threshold ₹{active_threshold}.",
             )
 
+            transaction.on_commit(
+                lambda: send_purchase_request_submitted_notification.delay(pr.id)
+            )
+
+
         serializer = PurchaseRequestSerializer(pr)
         return Response(
             {
@@ -419,6 +429,13 @@ class ApprovalStepApproveAPIView(APIView):
                 notes=notes,
             )
 
+            step_id = step.id
+            step_comments = comments
+            transaction.on_commit(
+                lambda: send_step_decision_notification.delay(step_id, "APPROVED", step_comments)
+            )
+
+
         return Response(
             {
                 "message": message,
@@ -501,6 +518,13 @@ class ApprovalStepRejectAPIView(APIView):
                 to_status=PurchaseRequest.Status.REJECTED,
                 notes=notes,
             )
+
+            step_id = step.id
+            step_comments = comments
+            transaction.on_commit(
+                lambda: send_step_decision_notification.delay(step_id, "REJECTED", step_comments)
+            )
+
 
         return Response(
             {
